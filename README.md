@@ -7,8 +7,9 @@ Fitur:
 - Antrean unduhan FIFO: jeda/lanjutkan tanpa mengulang dari awal, progres persen + byte + kecepatan + ETA.
 - Pilihan resolusi YouTube saat pratinjau; thumbnail tampil selama mengunduh.
 - Konfirmasi sebelum mengunduh memakai paket data seluler.
-- Pemutar offline: kecepatan/volume per sesi, kecerahan jendela aplikasi, layar penuh.
+- Pemutar offline: putar/jeda, lompat 10 detik, kecepatan pemutaran, dan layar penuh. Volume serta kecerahan mengikuti perangkat.
 - Tema Terang/Gelap/Sistem.
+- Koleksi berupa daftar terbaru lebih dahulu, dengan thumbnail, durasi, ukuran berkas, dan menu hapus. Ketuk thumbnail atau baris untuk memutar.
 
 Backend ekstraksi terpisah (Python stdlib + yt-dlp, baca di repo `backend-nonton-yuks`): server hanya menjawab deskriptor CDN, ponsel yang mengunduh dan menggabungkan video dengan `MediaMuxer` bawaan Android. Tidak ada Firebase, akun, WebView, atau folder publik di APK; berkas di penyimpanan privat (`filesDir/videos/`, `filesDir/thumbs/`, `filesDir/downloads.json`).
 
@@ -59,7 +60,7 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 - `lib/download_controller.dart` - satu `ChangeNotifier`: langganan progres, teruskan perintah.
 - `lib/main.dart` - pustaka (koleksi, antrean, riwayat), sheet tambah video, pengaturan tema.
 - `lib/player_screen.dart` - pemutar berkas lokal, tanpa fallback streaming.
-- `MainActivity.kt` - pemipaan channel, penampung share, tipe jaringan, sesi kecerahan player.
+- `MainActivity.kt` - pemipaan channel, penampung share, tipe jaringan, dan sesi layar tetap menyala saat membuka player.
 - `ApiClient.kt` - resolver `POST /v1/extract` + validasi deskriptor penuh.
 - `MediaTransfer.kt` - HTTPS terpin, unduh per track dengan resume Range, mux salin-sampel, verifikasi MP4.
 - `DownloadManager.kt` - antrean satu worker, commit atomik setelah verifikasi, jeda/lanjut.

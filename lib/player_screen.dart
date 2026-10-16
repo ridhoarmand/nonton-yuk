@@ -9,10 +9,6 @@ import 'bridge.dart';
 
 const _speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
-enum _Panel { none, volume, brightness, speed }
-
-/// Local file player: volume/speed apply to this player only, brightness to
-/// this app window only. Nothing here touches global device settings.
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({super.key, required this.title, required this.path});
 
@@ -26,21 +22,14 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   VideoPlayerController? controller;
   String? error;
-  String? panelError;
   bool _controls = true;
   Timer? _hide;
 
-  double _volume = 1;
-  double _beforeMute = 0.5;
   double _speed = 1;
   int _shownSecond = -1;
-  double? _brightness;
-  bool _brightnessTouched = false;
+  bool _wasPlaying = false;
   bool _fullscreen = false;
   bool _session = false;
-  _Panel _panel = _nonePanel;
-
-  static const _nonePanel = _Panel.none;
 
   @override
   void initState() {
@@ -84,15 +73,14 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       'Berkas video ini tidak dapat dibuka. Kemungkinan unduhannya belum lengkap; '
       'hapus lalu unduh ulang dari tautan sumber.';
 
+  // Layar tetap menyala selama memutar; tanpa itu video berhenti di tengah jalan.
   Future<void> _beginSession() async {
     if (_session || !mounted) return;
     try {
-      final res = await platformChannel.invokeMapMethod<Object?, Object?>('beginPlayerSession');
-      final value = res?['brightness'];
+      await platformChannel.invokeMethod<Object?>('beginPlayerSession');
       _session = true;
-      if (value is num && mounted) setState(() => _brightness = value.toDouble().clamp(0.05, 1.0));
     } on PlatformException {
-      // Kecerahan jendela tidak tersedia; pemutaran tetap jalan.
+      // Sesi tidak tersedia; pemutaran tetap jalan.
     } on MissingPluginException {
       // Bukan Android: pemutaran tetap jalan tanpa sesi jendela.
     }
@@ -113,10 +101,23 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   void _trackPosition() {
     final active = controller;
     if (active == null || !mounted) return;
-    final second = active.value.position.inSeconds;
-    if (second != _shownSecond) {
+    final value = active.value;
+    if (value.hasError) {
+      _hide?.cancel();
+      setState(() => error = _openFailed);
+      return;
+    }
+    final second = value.position.inSeconds;
+    if (second != _shownSecond || value.isPlaying != _wasPlaying ||
+        (value.isCompleted && !_controls)) {
       _shownSecond = second;
-      setState(() {});
+      _wasPlaying = value.isPlaying;
+      setState(() {
+        if (value.isCompleted) {
+          _hide?.cancel();
+          _controls = true;
+        }
+      });
     }
   }
 
@@ -126,7 +127,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     if (MediaQuery.accessibleNavigationOf(context)) return;
     _hide = Timer(const Duration(milliseconds: 3500), () {
       if (!mounted) return;
-      if ((controller?.value.isPlaying ?? false) && _panel == _Panel.none) {
+      if (controller?.value.isPlaying ?? false) {
         setState(() => _controls = false);
       }
     });
@@ -151,6 +152,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       await active.pause();
       _reveal();
     } else {
+      if (active.value.isCompleted) await active.seekTo(Duration.zero);
       await active.play();
       _scheduleHide();
     }
@@ -168,62 +170,18 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     if (mounted) setState(() {});
   }
 
-  Future<void> _setVolume(double value) async {
-    final active = controller;
-    if (active == null) return;
-    try {
-      await active.setVolume(value.clamp(0.0, 1.0));
-      if (mounted) {
-        setState(() {
-          _volume = value.clamp(0.0, 1.0);
-          panelError = null;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => panelError = 'Volume tidak dapat diubah.');
-    }
-  }
-
-  Future<void> _toggleMute() async {
-    if (_volume > 0) {
-      _beforeMute = _volume;
-      await _setVolume(0);
-    } else {
-      await _setVolume(_beforeMute > 0 ? _beforeMute : 0.5);
-    }
-  }
-
   Future<void> _setSpeed(double value) async {
     final active = controller;
     if (active == null) return;
     try {
       await active.setPlaybackSpeed(value);
-      if (mounted) {
-        setState(() {
-          _speed = value;
-          panelError = null;
-        });
-      }
+      if (mounted) setState(() => _speed = value);
     } catch (_) {
-      if (mounted) setState(() => panelError = 'Kecepatan tidak dapat diubah.');
-    }
-  }
-
-  Future<void> _setBrightness(double value) async {
-    if (!_session) return;
-    try {
-      await platformChannel.invokeMethod<Object?>('setPlayerBrightness', {'value': value});
       if (mounted) {
-        setState(() {
-          _brightness = value;
-          _brightnessTouched = true;
-          panelError = null;
-        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Kecepatan tidak dapat diubah.')),
+        );
       }
-    } on PlatformException catch (e) {
-      if (mounted) setState(() => panelError = e.message ?? 'Kecerahan tidak dapat diubah.');
-    } on MissingPluginException {
-      // Bukan Android: tidak ada sesi kecerahan untuk diubah.
     }
   }
 
@@ -262,18 +220,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       unawaited(_endSession());
       _reveal();
     } else if (mounted && ModalRoute.of(context)?.isCurrent == true) {
-      // Kembali ke rute ini: sesi dibuka lagi tanpa auto-play.
-      unawaited(_beginSession().then((_) async {
-        if (_brightnessTouched && _brightness != null && _session) {
-          try {
-            await platformChannel.invokeMethod<Object?>('setPlayerBrightness', {'value': _brightness});
-          } on PlatformException {
-            // Jendela kembali tanpa kecerahan pilihan; pengguna dapat menggeser lagi.
-          } on MissingPluginException {
-            // Bukan Android: tidak ada yang perlu diterapkan ulang.
-          }
-        }
-      }));
+      // Kembali ke rute ini: kunci layar-menyala dipasang lagi tanpa auto-play.
+      unawaited(_beginSession());
     }
   }
 
@@ -296,14 +244,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     super.dispose();
   }
 
-  void _openPanel(_Panel panel) {
-    _hide?.cancel();
-    setState(() {
-      _panel = _panel == panel ? _Panel.none : panel;
-      _controls = true;
-      panelError = null;
-    });
-  }
 
   @override
   Widget build(BuildContext context) => PopScope(
@@ -325,33 +265,33 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         if (active == null) {
           return const Center(child: CircularProgressIndicator(color: Colors.white));
         }
-        return OrientationBuilder(builder: (context, orientation) {
-          final landscape = orientation == Orientation.landscape;
-          return Stack(children: [
-            Positioned.fill(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _toggleControls,
-                child: Center(
-                  child: AspectRatio(
-                    aspectRatio: active.value.aspectRatio,
-                    child: VideoPlayer(active),
-                  ),
+        return Stack(children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _toggleControls,
+              child: Center(
+                child: AspectRatio(
+                  aspectRatio: active.value.aspectRatio,
+                  child: VideoPlayer(active),
                 ),
               ),
             ),
-            Positioned.fill(
-              child: IgnorePointer(
-                ignoring: !_controls,
+          ),
+          Positioned.fill(
+            child: IgnorePointer(
+              ignoring: !_controls,
+              child: ExcludeSemantics(
+                excluding: !_controls,
                 child: AnimatedOpacity(
                   opacity: _controls ? 1 : 0,
                   duration: const Duration(milliseconds: 180),
-                  child: _chrome(active, landscape),
+                  child: _chrome(active),
                 ),
               ),
             ),
-          ]);
-        });
+          ),
+        ]);
       }()),
     ),
   );
@@ -365,7 +305,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         style: const TextStyle(color: Colors.white, height: 1.5)),
       const SizedBox(height: 24),
       FilledButton(
-        onPressed: () => Navigator.pop(context),
+        onPressed: () => unawaited(_close()),
         style: FilledButton.styleFrom(
           backgroundColor: Colors.white,
           foregroundColor: Colors.black,
@@ -377,212 +317,119 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     ]),
   );
 
-  Widget _chrome(VideoPlayerController active, bool landscape) => DecoratedBox(
-    decoration: const BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0xCC000000), Color(0x00000000), Color(0xE6000000)],
-        stops: [0, 0.4, 1],
-      ),
-    ),
-    child: Column(children: [
-      Padding(
-        padding: const EdgeInsets.fromLTRB(4, 4, 16, 0),
+  Widget _chrome(VideoPlayerController active) => Stack(children: [
+    Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: ColoredBox(
+        color: const Color(0xCC000000),
         child: Row(children: [
           IconButton(
             icon: const Icon(Icons.arrow_back, color: Colors.white),
             tooltip: 'Kembali',
             onPressed: () => unawaited(_close()),
           ),
-          Expanded(child: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis,
-            style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600))),
-        ]),
-      ),
-      const Spacer(),
-      if (landscape && _panel != _Panel.none)
-        Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          Expanded(child: _transport(active)),
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 280),
+          Expanded(
+            child: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+          ),
+          PopupMenuButton<double>(
+            tooltip: 'Kecepatan pemutaran',
+            initialValue: _speed,
+            onOpened: _reveal,
+            onCanceled: _scheduleHide,
+            onSelected: (speed) async {
+              await _setSpeed(speed);
+              if (mounted) _scheduleHide();
+            },
+            itemBuilder: (_) => [
+              for (final speed in _speeds)
+                CheckedPopupMenuItem(
+                  value: speed,
+                  checked: speed == _speed,
+                  child: Text('${_formatSpeed(speed)}×'),
+                ),
+            ],
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(0, 0, 16, 8),
-              child: _panelCard(),
+              padding: const EdgeInsets.all(16),
+              child: Text('${_formatSpeed(_speed)}×',
+                style: const TextStyle(color: Colors.white)),
             ),
           ),
-        ])
-      else ...[
-        _transport(active),
-        if (_panel != _Panel.none)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: _panelCard(),
-          ),
-      ],
-    ]),
-  );
-
-  Widget _transport(VideoPlayerController active) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-    child: Column(children: [
-      VideoProgressIndicator(
-        active,
-        allowScrubbing: true,
-        padding: const EdgeInsets.symmetric(vertical: 14),
-        colors: const VideoProgressColors(
-          playedColor: Colors.white,
-          bufferedColor: Color(0x66FFFFFF),
-          backgroundColor: Color(0x33FFFFFF),
-        ),
+        ]),
       ),
-      Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        IconButton(
-          icon: const Icon(Icons.replay_10, color: Colors.white),
-          tooltip: 'Mundur 10 detik',
-          onPressed: () => unawaited(_skip(const Duration(seconds: -10))),
+    ),
+    Center(
+      child: DecoratedBox(
+        decoration: const BoxDecoration(
+          color: Color(0xCC000000),
+          borderRadius: BorderRadius.all(Radius.circular(12)),
         ),
-        IconButton(
-          icon: Icon(active.value.isPlaying ? Icons.pause : Icons.play_arrow,
-            color: Colors.white, size: 32),
-          tooltip: active.value.isPlaying ? 'Jeda video' : 'Putar video',
-          onPressed: () => unawaited(_togglePlay()),
-        ),
-        IconButton(
-          icon: const Icon(Icons.forward_10, color: Colors.white),
-          tooltip: 'Maju 10 detik',
-          onPressed: () => unawaited(_skip(const Duration(seconds: 10))),
-        ),
-      ]),
-      Text(
-        '${formatDuration(active.value.position.inMilliseconds)} / ${formatDuration(active.value.duration.inMilliseconds)}',
-        style: const TextStyle(color: Colors.white70, fontSize: 13,
-          fontFeatures: [FontFeature.tabularFigures()]),
-      ),
-      const SizedBox(height: 4),
-      // Bar kecil berlabel; panel terkait dibuka sesuai permintaan.
-      SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          TextButton.icon(
-            icon: Icon(_volume == 0 ? Icons.volume_off : Icons.volume_up, color: Colors.white),
-            label: Text('Volume ${_volumeLabel()}', style: const TextStyle(color: Colors.white)),
-            onPressed: () => _openPanel(_Panel.volume),
-          ),
-          TextButton.icon(
-            icon: const Icon(Icons.brightness_6, color: Colors.white),
-            label: const Text('Kecerahan', style: TextStyle(color: Colors.white)),
-            onPressed: () => _openPanel(_Panel.brightness),
-          ),
-          TextButton(
-            onPressed: () => _openPanel(_Panel.speed),
-            child: Text('${_formatSpeed(_speed)}×', style: const TextStyle(color: Colors.white)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          IconButton(
+            icon: const Icon(Icons.replay_10, color: Colors.white),
+            tooltip: 'Mundur 10 detik',
+            onPressed: () => unawaited(_skip(const Duration(seconds: -10))),
           ),
           IconButton(
-            icon: Icon(_fullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
-            tooltip: _fullscreen ? 'Keluar layar penuh' : 'Layar penuh',
-            onPressed: () => unawaited(_fullscreen ? _exitFullscreen() : _enterFullscreen()),
+            icon: Icon(
+              active.value.isCompleted ? Icons.replay
+                  : active.value.isPlaying ? Icons.pause : Icons.play_arrow,
+              color: Colors.white, size: 36,
+            ),
+            style: IconButton.styleFrom(minimumSize: const Size(64, 64)),
+            tooltip: active.value.isCompleted ? 'Putar ulang'
+                : active.value.isPlaying ? 'Jeda video' : 'Putar video',
+            onPressed: () => unawaited(_togglePlay()),
+          ),
+          IconButton(
+            icon: const Icon(Icons.forward_10, color: Colors.white),
+            tooltip: 'Maju 10 detik',
+            onPressed: () => unawaited(_skip(const Duration(seconds: 10))),
           ),
         ]),
       ),
-    ]),
-  );
-
-  String _volumeLabel() => _volume == 0 ? 'mati' : '${(_volume * 100).round()}%';
-
-  static String _formatSpeed(double value) =>
-      value.toString().replaceAll(RegExp(r'\.0$'), '');
-
-  Widget _panelCard() => Container(
-    padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-    decoration: const BoxDecoration(
-      color: Color(0xF2222222),
-      borderRadius: BorderRadius.all(Radius.circular(12)),
     ),
-    // Slider mengikuti chrome putih di atas video, bukan aksen pustaka.
-    child: SliderTheme(
-      data: const SliderThemeData(
-        activeTrackColor: Colors.white,
-        inactiveTrackColor: Color(0x61FFFFFF),
-        thumbColor: Colors.white,
-        overlayColor: Color(0x29FFFFFF),
+    Positioned(
+      bottom: 0,
+      left: 0,
+      right: 0,
+      child: ColoredBox(
+        color: const Color(0xCC000000),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            VideoProgressIndicator(
+              active,
+              allowScrubbing: true,
+              padding: const EdgeInsets.symmetric(vertical: 20),
+              colors: const VideoProgressColors(
+                playedColor: Colors.white,
+                bufferedColor: Color(0x66FFFFFF),
+                backgroundColor: Color(0x33FFFFFF),
+              ),
+            ),
+            Row(children: [
+              Expanded(
+                child: Text(
+                  '${formatDuration(active.value.position.inMilliseconds)} / ${formatDuration(active.value.duration.inMilliseconds)}',
+                  style: const TextStyle(color: Colors.white, fontSize: 13,
+                    fontFeatures: [FontFeature.tabularFigures()]),
+                ),
+              ),
+              IconButton(
+                icon: Icon(_fullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
+                tooltip: _fullscreen ? 'Keluar layar penuh' : 'Layar penuh',
+                onPressed: () => unawaited(_fullscreen ? _exitFullscreen() : _enterFullscreen()),
+              ),
+            ]),
+          ]),
+        ),
       ),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-      switch (_panel) {
-        _Panel.volume => _volumePanel(),
-        _Panel.brightness => _brightnessPanel(),
-        _Panel.speed => _speedPanel(),
-        _Panel.none => const SizedBox.shrink(),
-      },
-      if (panelError != null) ...[
-        const SizedBox(height: 4),
-        Text(panelError!, style: const TextStyle(color: Color(0xFFFFB4AB), fontSize: 13)),
-      ],
-      ]),
-    ),
-  );
-
-  Widget _volumePanel() => Row(children: [
-    IconButton(
-      icon: Icon(_volume == 0 ? Icons.volume_off : Icons.volume_up, color: Colors.white),
-      tooltip: _volume == 0 ? 'Suarakan' : 'Bisukan',
-      onPressed: () => unawaited(_toggleMute()),
-    ),
-    Expanded(
-      child: Slider(
-        value: _volume,
-        min: 0,
-        max: 1,
-        divisions: 20,
-        label: _volumeLabel(),
-        onChanged: (value) => unawaited(_setVolume(value)),
-      ),
-    ),
-    SizedBox(
-      width: 52,
-      child: Text(_volumeLabel(), textAlign: TextAlign.end,
-        style: const TextStyle(color: Colors.white, fontSize: 13,
-          fontFeatures: [FontFeature.tabularFigures()])),
     ),
   ]);
 
-  Widget _brightnessPanel() {
-    final value = _brightness ?? 0.5;
-    return Row(children: [
-      const Icon(Icons.brightness_6, color: Colors.white),
-      Expanded(
-        child: Slider(
-          value: value.clamp(0.05, 1.0),
-          min: 0.05,
-          max: 1,
-          label: '${(value * 100).round()}%',
-          onChanged: (next) => unawaited(_setBrightness(next)),
-        ),
-      ),
-      SizedBox(
-        width: 52,
-        child: Text('${(value * 100).round()}%', textAlign: TextAlign.end,
-          style: const TextStyle(color: Colors.white, fontSize: 13,
-            fontFeatures: [FontFeature.tabularFigures()])),
-      ),
-    ]);
-  }
-
-  Widget _speedPanel() => Wrap(
-    spacing: 8,
-    children: [
-      for (final option in _speeds)
-        ChoiceChip(
-          label: Text('${_formatSpeed(option)}×',
-            style: TextStyle(color: _speed == option ? Colors.black : Colors.white)),
-          selected: _speed == option,
-          selectedColor: Colors.white,
-          checkmarkColor: Colors.black,
-          backgroundColor: const Color(0xFF333333),
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(10)),
-          ),
-          onSelected: (_) => unawaited(_setSpeed(option)),
-        ),
-    ],
-  );
+  static String _formatSpeed(double value) =>
+      value.toString().replaceAll(RegExp(r'\.0$'), '');
 }

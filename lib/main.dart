@@ -411,11 +411,15 @@ class _CollectionScreenState extends State<CollectionScreen> {
                 if (ready.isEmpty)
                   SliverToBoxAdapter(child: _emptyState())
                 else
-                  SliverToBoxAdapter(child: _CollectionGrid(
-                    items: ready,
-                    onPlay: _play,
-                    onDelete: _confirmDelete,
-                  )),
+                  SliverList.builder(
+                    itemCount: ready.length,
+                    itemBuilder: (context, i) => _ReadyRow(
+                      key: ValueKey(ready[i].id),
+                      item: ready[i],
+                      onPlay: _play,
+                      onDelete: _confirmDelete,
+                    ),
+                  ),
                 if (others.isNotEmpty) ...[
                   const SliverToBoxAdapter(child: _SectionTitle('Unduhan lainnya')),
                   SliverList.builder(
@@ -483,123 +487,52 @@ class _SectionTitle extends StatelessWidget {
   }
 }
 
-/// Koleksi siap tonton: ubin 16:9 berukuran isi; baris saat sempit atau teks besar.
-class _CollectionGrid extends StatelessWidget {
-  const _CollectionGrid({required this.items, required this.onPlay, required this.onDelete});
 
-  final List<SavedMedia> items;
+class _ReadyRow extends StatelessWidget {
+  const _ReadyRow({super.key, required this.item, required this.onPlay, required this.onDelete});
+
+  final SavedMedia item;
   final ValueChanged<SavedMedia> onPlay;
   final ValueChanged<SavedMedia> onDelete;
 
   @override
   Widget build(BuildContext context) {
-    final width = MediaQuery.widthOf(context);
-    final scaleFactor = MediaQuery.textScalerOf(context).scale(1);
-    if (width < 360 || scaleFactor >= 1.5) {
-      return Column(
-        children: [for (final item in items) _ReadyRow(item: item, onPlay: onPlay, onDelete: onDelete)],
-      );
-    }
-    final columns = width >= 900 ? 4 : width >= 600 ? 3 : 2;
+    final theme = Theme.of(context);
+    final largeText = MediaQuery.textScalerOf(context).scale(1) >= 1.5;
     return Center(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 1100),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Wrap(
-            spacing: 12,
-            runSpacing: 16,
-            children: [
-              for (final item in items)
-                SizedBox(
-                  width: (width.clamp(0, 1100) - 32 - 12 * (columns - 1)) / columns,
-                  child: _Tile(item: item, onPlay: onPlay, onDelete: onDelete),
-                ),
-            ],
+        constraints: const BoxConstraints(maxWidth: 800),
+        child: InkWell(
+          onTap: () => onPlay(item),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _Thumb(
+                thumbPath: item.thumbPath,
+                durationMs: item.durationMs,
+                title: item.title,
+                width: largeText ? 88 : 112,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(item.title, maxLines: largeText ? 3 : 2,
+                    overflow: TextOverflow.ellipsis, style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 4),
+                  Text(
+                    [
+                      platformById(item.platform)?.label ?? item.platform,
+                      if (item.bytes > 0) formatBytes(item.bytes),
+                    ].join(' · '),
+                    style: theme.textTheme.bodySmall,
+                  ),
+                ]),
+              ),
+              _ItemMenu(onDelete: () => onDelete(item)),
+            ]),
           ),
         ),
       ),
-    );
-  }
-}
-
-class _Tile extends StatelessWidget {
-  const _Tile({required this.item, required this.onPlay, required this.onDelete});
-
-  final SavedMedia item;
-  final ValueChanged<SavedMedia> onPlay;
-  final ValueChanged<SavedMedia> onDelete;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return InkWell(
-      borderRadius: const BorderRadius.all(Radius.circular(8)),
-      onTap: () => onPlay(item),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Thumb(
-          thumbPath: item.thumbPath,
-          durationMs: item.durationMs,
-          title: item.title,
-          width: double.infinity,
-        ),
-        const SizedBox(height: 8),
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(item.title, maxLines: 2, overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.titleMedium),
-              const SizedBox(height: 2),
-              Text(
-                [
-                  platformById(item.platform)?.label ?? item.platform,
-                  if (item.bytes > 0) formatBytes(item.bytes),
-                ].join(' · '),
-                style: theme.textTheme.bodySmall,
-              ),
-            ]),
-          ),
-          _ItemMenu(onDelete: () => onDelete(item)),
-        ]),
-      ]),
-    );
-  }
-}
-
-class _ReadyRow extends StatelessWidget {
-  const _ReadyRow({required this.item, required this.onPlay, required this.onDelete});
-
-  final SavedMedia item;
-  final ValueChanged<SavedMedia> onPlay;
-  final ValueChanged<SavedMedia> onDelete;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 8, 12),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Thumb(thumbPath: item.thumbPath, durationMs: item.durationMs, title: item.title, width: 120),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            InkWell(
-              onTap: () => onPlay(item),
-              child: Text(item.title, maxLines: 2, overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.titleMedium),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              [
-                platformById(item.platform)?.label ?? item.platform,
-                if (item.bytes > 0) formatBytes(item.bytes),
-              ].join(' · '),
-              style: theme.textTheme.bodySmall,
-            ),
-          ]),
-        ),
-        _ItemMenu(onDelete: () => onDelete(item)),
-      ]),
     );
   }
 }

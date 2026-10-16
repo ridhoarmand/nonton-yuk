@@ -5,7 +5,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -124,10 +123,6 @@ class MainActivity : FlutterActivity() {
                         DownloadManager.list(applicationContext)
                     }
                     "beginPlayerSession" -> beginPlayerSession(result)
-                    "setPlayerBrightness" -> {
-                        val value = (arguments?.get("value") as? Number)?.toDouble()
-                        setPlayerBrightness(result, value)
-                    }
                     "endPlayerSession" -> {
                         endPlayerSession()
                         result.success(null)
@@ -248,57 +243,22 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    // Player window session: app-window brightness only, never the system setting.
-    private var sessionBrightness: Float? = null
+    // Player session: only keeps the screen on while playing, never touches brightness.
     private var addedKeepScreenOn = false
 
     private fun beginPlayerSession(result: MethodChannel.Result) {
-        if (sessionBrightness == null) {
-            val attributes = window.attributes
-            sessionBrightness = attributes.screenBrightness
-            if (attributes.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON == 0) {
-                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                addedKeepScreenOn = true
-            }
+        if (window.attributes.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON == 0) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            addedKeepScreenOn = true
         }
-        result.success(mapOf("brightness" to effectiveBrightness()))
-    }
-
-    private fun setPlayerBrightness(result: MethodChannel.Result, value: Double?) {
-        if (sessionBrightness == null) {
-            result.error("noPlayerSession", "Sesi pemutar belum dimulai.", null)
-            return
-        }
-        if (value == null || !value.isFinite() || value < 0.05 || value > 1.0) {
-            result.error("invalidArguments", "Kecerahan harus 0,05 sampai 1.", null)
-            return
-        }
-        val attributes = window.attributes
-        attributes.screenBrightness = value.toFloat()
-        window.attributes = attributes
         result.success(null)
     }
 
     private fun endPlayerSession() {
-        val original = sessionBrightness ?: return
-        sessionBrightness = null
-        val attributes = window.attributes
-        attributes.screenBrightness = original
-        window.attributes = attributes
         if (addedKeepScreenOn) {
             addedKeepScreenOn = false
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
-    }
-
-    /** Current window override, falling back to a read-only peek at the system value. */
-    private fun effectiveBrightness(): Float {
-        val current = window.attributes.screenBrightness
-        if (current >= 0f) return current.coerceIn(0.05f, 1f)
-        val system = runCatching {
-            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-        }.getOrNull()
-        return if (system != null && system > 0) (system / 255f).coerceIn(0.05f, 1f) else 0.5f
     }
 
     companion object {
