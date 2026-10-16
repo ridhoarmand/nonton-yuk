@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="bg_downloader_cancel">Batal</string>
+    <string name="bg_downloader_pause">Jeda</string>
+    <string name="bg_downloader_resume">Lanjutkan</string>
+</resources>
