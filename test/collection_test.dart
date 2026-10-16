@@ -123,6 +123,37 @@ void main() {
     expect(native.probeCalls, isEmpty);
   });
 
+  for (final state in ['running', 'paused', 'interrupted', 'failed']) {
+    testWidgets('cache $state dapat ditonton tanpa path atau enqueue baru', (tester) async {
+      final native = _Native();
+      native.list = [
+        <Object?, Object?>{
+          'id': 'cached',
+          'title': 'Video tersimpan sebagian',
+          'state': state,
+          'playable': true,
+          'resumable': state != 'running',
+          'bytes': 2048,
+          'approxBytes': 4096,
+          'progress': 0.5,
+        },
+      ];
+      await native.install(tester);
+      await _pumpApp(tester);
+
+      expect(find.text('Tonton sekarang'), findsOneWidget);
+      expect(find.byType(AddVideoSheet), findsNothing);
+      expect(native.probeCalls, isEmpty);
+      if (state == 'interrupted' || state == 'failed') {
+        expect(find.text('Lanjutkan'), findsOneWidget);
+        expect(find.text('Coba lagi'), findsNothing);
+      } else if (state == 'paused') {
+        expect(find.byTooltip('Lanjutkan unduhan'), findsOneWidget);
+      }
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   testWidgets('share membuka tepat satu sheet tanpa probe otomatis', (tester) async {
     final native = _Native();
     native.shares = ['Tonton https://www.youtube.com/watch?v=jNQXAC9IVRw seru!'];

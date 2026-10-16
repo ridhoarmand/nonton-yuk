@@ -124,6 +124,8 @@ class SavedMedia {
     this.height = 0,
     this.restarted = false,
     this.speedBps = 0,
+    this.playable = false,
+    this.resumable = false,
   });
 
   String id;
@@ -146,8 +148,12 @@ class SavedMedia {
   int height;
   bool restarted;
   int speedBps;
+  bool playable;
+  bool resumable;
 
   bool get ready => state == TaskState.done && path != null;
+
+  bool get canPlay => state != TaskState.canceled && (ready || playable);
 
   bool get active =>
       state == TaskState.queued ||
@@ -162,7 +168,6 @@ class SavedMedia {
   String get statusLabel => switch (state) {
         TaskState.queued => 'Menunggu antrean',
         TaskState.running => switch (phase) {
-            'merge' => 'Menggabungkan berkas',
             'video' => 'Mengunduh video',
             'audio' => 'Mengunduh audio',
             _ => 'Mengunduh',
@@ -201,6 +206,8 @@ class SavedMedia {
       height: _int(raw['height']),
       restarted: raw['restarted'] == true,
       speedBps: _int(raw['speedBps']),
+      playable: raw['playable'] == true,
+      resumable: raw['resumable'] == true,
     );
   }
 
@@ -227,6 +234,8 @@ class SavedMedia {
     if (raw.containsKey('height')) height = _int(raw['height']);
     if (raw.containsKey('restarted')) restarted = raw['restarted'] == true;
     if (raw.containsKey('speedBps')) speedBps = _int(raw['speedBps']);
+    if (raw.containsKey('playable')) playable = raw['playable'] == true;
+    if (raw.containsKey('resumable')) resumable = raw['resumable'] == true;
   }
 }
 

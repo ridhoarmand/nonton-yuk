@@ -277,11 +277,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
   }
 
   Future<void> _play(SavedMedia item) async {
-    final path = item.path;
-    if (path == null || path.isEmpty) return;
+    if (!item.canPlay) return;
     await Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => PlayerScreen(title: item.title, path: path)),
+      MaterialPageRoute(builder: (_) => PlayerScreen(title: item.title, id: item.id)),
     );
     await controller.reload();
     // Share yang ditahan saat player terbuka dibuka setelah kembali ke pustaka.
@@ -404,6 +403,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       onCancel: () => unawaited(controller.cancel(active[i].id)),
                       onPause: () => unawaited(controller.pause(active[i].id)),
                       onResume: () => unawaited(controller.resume(active[i].id)),
+                      onPlay: () => unawaited(_play(active[i])),
                     ),
                   ),
                 ],
@@ -427,6 +427,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     itemBuilder: (context, i) => _TerminalRow(
                       item: others[i],
                       onRetry: _retryOf(others[i]),
+                      onPlay: others[i].canPlay ? () => unawaited(_play(others[i])) : null,
                       onDelete: () => unawaited(_confirmDelete(others[i])),
                     ),
                   ),
@@ -441,6 +442,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
   );
 
   VoidCallback? _retryOf(SavedMedia item) {
+    if (item.resumable) return () => unawaited(controller.resume(item.id));
     final source = item.sourceUrl;
     if (source == null || source.isEmpty) return null;
     if (platformById(item.platform) == null) return null;
@@ -509,6 +511,7 @@ class _ReadyRow extends StatelessWidget {
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
               _Thumb(
                 thumbPath: item.thumbPath,
+                networkUrl: item.thumbnailUrl,
                 durationMs: item.durationMs,
                 title: item.title,
                 width: largeText ? 88 : 112,
@@ -633,12 +636,13 @@ class _ThumbFallback extends StatelessWidget {
 }
 
 class _QueueRow extends StatelessWidget {
-  const _QueueRow({required this.item, required this.onCancel, required this.onPause, required this.onResume});
+  const _QueueRow({required this.item, required this.onCancel, required this.onPause, required this.onResume, required this.onPlay});
 
   final SavedMedia item;
   final VoidCallback onCancel;
   final VoidCallback onPause;
   final VoidCallback onResume;
+  final VoidCallback onPlay;
 
   String _detail() {
     final total = item.approxBytes;
@@ -659,10 +663,11 @@ class _QueueRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final detail = _detail();
-    final pausable = !item.paused && item.phase != 'merge';
+    final pausable = !item.paused;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 8, 12),
-      child: Row(children: [
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
         _Thumb(thumbPath: item.thumbPath, networkUrl: item.thumbnailUrl, durationMs: 0, title: item.title, width: 120),
         const SizedBox(width: 12),
         Expanded(
@@ -697,17 +702,25 @@ class _QueueRow extends StatelessWidget {
           tooltip: 'Batalkan unduhan',
           onPressed: onCancel,
         ),
+        ]),
+        if (item.canPlay)
+          TextButton.icon(
+            onPressed: onPlay,
+            icon: const Icon(Icons.play_arrow),
+            label: const Text('Tonton sekarang'),
+          ),
       ]),
     );
   }
 }
 
 class _TerminalRow extends StatelessWidget {
-  const _TerminalRow({required this.item, required this.onRetry, required this.onDelete});
+  const _TerminalRow({required this.item, required this.onRetry, required this.onDelete, this.onPlay});
 
   final SavedMedia item;
   final VoidCallback? onRetry;
   final VoidCallback onDelete;
+  final VoidCallback? onPlay;
 
   @override
   Widget build(BuildContext context) {
@@ -725,12 +738,21 @@ class _TerminalRow extends StatelessWidget {
               (item.error ?? '').isNotEmpty ? item.error! : item.statusLabel,
               style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
             ),
+            Wrap(spacing: 8, children: [
+              if (onRetry != null)
+                TextButton(
+                  onPressed: onRetry,
+                  child: Text(item.resumable ? 'Lanjutkan' : 'Coba lagi'),
+                ),
+              if (onPlay != null)
+                TextButton.icon(
+                  onPressed: onPlay,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Tonton sekarang'),
+                ),
+            ]),
           ]),
         ),
-        if (onRetry != null)
-          TextButton(onPressed: onRetry, child: const Text('Coba lagi'))
-        else
-          const SizedBox(width: 8),
         IconButton(
           icon: const Icon(Icons.delete_outline),
           tooltip: 'Hapus unduhan',

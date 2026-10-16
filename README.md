@@ -4,14 +4,15 @@ Simpan video publik Facebook dan YouTube di ponsel untuk ditonton offline. Packa
 
 Fitur:
 
-- Antrean unduhan FIFO: jeda/lanjutkan tanpa mengulang dari awal, progres persen + byte + kecepatan + ETA.
+- Antrean unduhan dengan cache bersama: setelah buffer siap, ketuk **Tonton sekarang** sambil sisa video disimpan.
+- Jeda/lanjutkan mempertahankan byte tersimpan, termasuk setelah aplikasi tertutup. Progres menampilkan persen, byte, kecepatan, dan ETA.
 - Pilihan resolusi YouTube saat pratinjau; thumbnail tampil selama mengunduh.
 - Konfirmasi sebelum mengunduh memakai paket data seluler.
 - Pemutar offline: putar/jeda, lompat 10 detik, kecepatan pemutaran, dan layar penuh. Volume serta kecerahan mengikuti perangkat.
 - Tema Terang/Gelap/Sistem.
 - Koleksi berupa daftar terbaru lebih dahulu, dengan thumbnail, durasi, ukuran berkas, dan menu hapus. Ketuk thumbnail atau baris untuk memutar.
 
-Backend ekstraksi terpisah (Python stdlib + yt-dlp, baca di repo `backend-nonton-yuks`): server hanya menjawab deskriptor CDN, ponsel yang mengunduh dan menggabungkan video dengan `MediaMuxer` bawaan Android. Tidak ada Firebase, akun, WebView, atau folder publik di APK; berkas di penyimpanan privat (`filesDir/videos/`, `filesDir/thumbs/`, `filesDir/downloads.json`).
+Backend ekstraksi terpisah (Python stdlib + yt-dlp, repo `backend-nonton-yuks`) hanya menjawab deskriptor CDN. Android menyimpan media ke cache privat Media3; player membaca cache yang sama. Video dan audio terpisah diputar bersamaan tanpa menulis ulang seluruh video menjadi satu MP4. Setelah seluruh bagian tersimpan, pemutaran tidak membutuhkan jaringan. MP4 koleksi lama tetap dapat diputar.
 
 ## Syarat
 
@@ -23,9 +24,9 @@ Backend ekstraksi terpisah (Python stdlib + yt-dlp, baca di repo `backend-nonton
 Origin + token backend disuntik saat build Gradle, tidak ada di source code:
 
 ```sh
-export NONTON_YUKS_API_ORIGIN=https://backend-Anda.example
-export NONTON_YUKS_API_TOKEN=<isi NONTONIN_API_TOKEN di .env backend>
-flutter build apk --release --split-per-abi
+export NONTON_YUKS_API_ORIGIN=https://backend.example
+export NONTON_YUKS_API_TOKEN='token-dari-backend'
+flutter build apk --release --obfuscate --split-per-abi --split-debug-info=build/symbols
 ```
 
 Alternatif: tulis `nontonYuksApiOrigin` / `nontonYuksApiToken` di `~/.gradle/gradle.properties`. Tanpa keduanya, probe/unduh gagal cepat dengan pesan konfigurasi. `android/local.properties`, `key.properties`, `*.jks`/`*.keystore` sudah di-gitignore.
@@ -39,7 +40,7 @@ flutter test
 flutter build apk --debug
 ```
 
-Tes instrumentasi native (`MediaTransferTest`, mux + verifikasi MP4) butuh emulator/device menyala:
+Tes instrumentasi native (cache bersama, playback sebelum selesai, pemulihan jeda/proses, validasi transport, dan pemulihan MP4 lama) membutuhkan emulator khusus pengujian serta `JAVA_HOME` mengarah ke JDK Android Studio. Jangan jalankan pada perangkat berisi koleksi penting: tugas instrumentasi dapat menghapus aplikasi dan datanya setelah pengujian.
 
 ```sh
 android/gradlew -p android :app:connectedDebugAndroidTest
@@ -47,11 +48,22 @@ android/gradlew -p android :app:connectedDebugAndroidTest
 
 ## Rilis
 
-R8 + resource shrinking aktif. Rilis memakai kunci debug secara default; ganti `signingConfig` di `android/app/build.gradle.kts` untuk distribusi. Instaloni tanpa menghapus data:
+R8 dan resource shrinking aktif; perintah di atas juga mengobfuscasi Dart. Simpan direktori `build/symbols/` bersama arsip rilis untuk membaca stack trace dengan `flutter symbolize`. Direktori build dan simbol tidak ikut Git. Obfuscation tidak membuat token di APK menjadi rahasia.
+
+Rilis memakai kunci debug secara default; ganti `signingConfig` di `android/app/build.gradle.kts` untuk distribusi publik. Untuk pembaruan, gunakan sertifikat yang sama dan version code lebih tinggi. Instal tanpa menghapus data:
 
 ```sh
 adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ```
+
+## Jeda dan pemulihan
+
+- Menutup aplikasi tidak menghapus cache. Saat dibuka lagi, unduhan yang belum lengkap dijeda; ketuk **Lanjutkan** untuk meneruskan. Cache yang sudah lengkap langsung dikenali sebagai siap offline.
+- Hanya **Batalkan** atau **Hapus** yang menghapus data unduhan terpilih. Gangguan koneksi dan respons terpotong mempertahankan bagian yang sudah tersimpan.
+- Jika server mendukung Range, hanya bagian yang belum ada yang diminta. Server yang mengabaikan Range memakai respons berurutan yang sama selama transfer; setelah jeda server dapat mengirim ulang awalan, tetapi cache dan progres tidak kembali ke nol.
+- URL media dapat kedaluwarsa atau kontennya berubah. Aplikasi menolak mencampur representasi berbeda dan tidak menghapus cache diam-diam.
+- Berkas video/audio lama yang sudah lengkap dapat diputar terpisah tanpa merge. Partial lama tanpa metadata yang cukup dipertahankan, tetapi tidak ditebak atau digabung dengan sumber baru.
+
 
 ## Peta berkas
 
@@ -59,11 +71,14 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 - `lib/bridge.dart` - channel native, model data, `ExtractionException`, pemformat angka.
 - `lib/download_controller.dart` - satu `ChangeNotifier`: langganan progres, teruskan perintah.
 - `lib/main.dart` - pustaka (koleksi, antrean, riwayat), sheet tambah video, pengaturan tema.
-- `lib/player_screen.dart` - pemutar berkas lokal, tanpa fallback streaming.
-- `MainActivity.kt` - pemipaan channel, penampung share, tipe jaringan, dan sesi layar tetap menyala saat membuka player.
-- `ApiClient.kt` - resolver `POST /v1/extract` + validasi deskriptor penuh.
-- `MediaTransfer.kt` - HTTPS terpin, unduh per track dengan resume Range, mux salin-sampel, verifikasi MP4.
-- `DownloadManager.kt` - antrean satu worker, commit atomik setelah verifikasi, jeda/lanjut.
+- `lib/player_screen.dart` - layar Flutter untuk native player, navigasi kembali, dan fullscreen.
+- `CachedPlayerView.kt` - ExoPlayer/PlayerView dengan sumber berdasarkan ID unduhan, bukan URL dari Dart.
+- `MainActivity.kt` - pemipaan channel, penampung share, tipe jaringan, dan lifecycle player.
+- `ApiClient.kt` - resolver `POST /v1/extract` dan validasi deskriptor.
+- `MediaCache.kt` - cache persisten, pengunduh dan player bersama, sumber video/audio serta fragmen berurutan.
+- `PinnedHttpDataSource.kt` - HTTPS terpin, validasi DNS/redirect/Range, serta pembatalan socket.
+- `MediaTransfer.kt` - pemeriksaan MP4 koleksi lama dan track lama yang sudah lengkap.
+- `DownloadManager.kt` - antrean, progres byte cache, jeda/lanjut, dan pemulihan setelah proses berhenti.
 - `DownloadService.kt` / `DownloadStore.kt` - foreground service `dataSync`; JSON atomik.
 
 ### Kontrak channel
@@ -79,4 +94,6 @@ adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 | `networkType` | - | `wifi`, `cellular`, atau `unknown` |
 | `listDownloads` / `takePendingShares` | - | daftar entri / daftar teks share |
 
-`com.nonton.yuks/progress` (EventChannel) mendorong potongan entri saat status berubah. Status: `queued`, `running` (`phase` `download`/`video`/`audio`/`merge`, `progress` 0..1, `etaSeconds`, `speedBps`, `bytes`), `paused`, `done`, `failed`, `canceled`, `interrupted`. URL bertanda tangan dan token tidak pernah mencapai Dart, log, atau store.
+`com.nonton.yuks/progress` (EventChannel) mendorong potongan entri saat status berubah. Status: `queued`, `running`, `paused`, `done`, `failed`, `canceled`, `interrupted`; entri menyertakan `progress`, `etaSeconds`, `speedBps`, `bytes`, `playable`, dan `resumable`. Status `done` hanya diberikan saat seluruh byte media tersimpan.
+
+Player native memakai platform view `com.nonton.yuks/player` dengan argumen `{id}`. URL media bertanda tangan dan header disimpan hanya di manifest privat Android agar transfer dapat dilanjutkan; tidak dikirim ke Dart atau log. Token backend tidak masuk manifest media.

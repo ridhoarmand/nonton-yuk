@@ -98,5 +98,44 @@ void main() {
     expect(SavedMedia(id: 'a', state: TaskState.done).active, isFalse);
     expect(SavedMedia(id: 'a', approxBytes: 1024).sizeLabel, '1 KB');
     expect(SavedMedia(id: 'a').sizeLabel, '');
+    expect(SavedMedia(id: 'old', state: TaskState.done, path: '/old.mp4').canPlay, isTrue);
+    expect(SavedMedia(id: 'empty', state: TaskState.done).canPlay, isFalse);
+  });
+
+  test('cached playback and resume capability survive partial progress events', () {
+    final media = SavedMedia.fromMap({
+      'id': 'cached',
+      'state': 'running',
+      'bytes': 4096,
+      'playable': true,
+      'resumable': true,
+    })!;
+    expect(media.ready, isFalse);
+    expect(media.canPlay, isTrue);
+    expect(media.resumable, isTrue);
+
+    for (final state in ['paused', 'interrupted', 'failed']) {
+      media.applyEvent({'state': state});
+      expect(media.canPlay, isTrue, reason: state);
+      expect(media.resumable, isTrue, reason: state);
+      expect(media.bytes, 4096);
+    }
+    media.applyEvent({'playable': false, 'resumable': false});
+    expect(media.canPlay, isFalse);
+    expect(media.resumable, isFalse);
+    expect(media.bytes, 4096);
+  });
+
+  test('capability flags are opt-in booleans and canceled tasks cannot play', () {
+    for (final value in [null, 1, 'true', false]) {
+      final media = SavedMedia.fromMap({
+        'id': 'a',
+        'playable': value,
+        'resumable': value,
+      })!;
+      expect(media.canPlay, isFalse);
+      expect(media.resumable, isFalse);
+    }
+    expect(SavedMedia(id: 'a', state: TaskState.canceled, playable: true).canPlay, isFalse);
   });
 }

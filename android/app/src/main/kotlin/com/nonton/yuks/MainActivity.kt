@@ -5,7 +5,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -17,6 +16,7 @@ import java.util.concurrent.RejectedExecutionException
  * Channel plumbing only: shares the fixed method table with Dart and forwards the download queue's
  * progress events. All download behaviour lives in [DownloadManager].
  */
+@androidx.annotation.OptIn(markerClass = [androidx.media3.common.util.UnstableApi::class])
 class MainActivity : FlutterActivity() {
     private val pendingShares = ArrayDeque<String>()
     private val ioExecutor = Executors.newSingleThreadExecutor()
@@ -43,6 +43,9 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
+        flutterEngine.platformViewsController.registry.registerViewFactory(
+            "com.nonton.yuks/player", CachedPlayerViewFactory(this, messenger),
+        )
 
         progressChannel = EventChannel(messenger, "com.nonton.yuks/progress").also { channel ->
             channel.setStreamHandler(object : EventChannel.StreamHandler {
@@ -121,11 +124,6 @@ class MainActivity : FlutterActivity() {
                         result, "listFailed", "Daftar unduhan tidak dapat dibaca.",
                     ) {
                         DownloadManager.list(applicationContext)
-                    }
-                    "beginPlayerSession" -> beginPlayerSession(result)
-                    "endPlayerSession" -> {
-                        endPlayerSession()
-                        result.success(null)
                     }
                     "takePendingShares" -> {
                         val shares = pendingShares.toList()
@@ -227,13 +225,12 @@ class MainActivity : FlutterActivity() {
 
     override fun onPause() {
         super.onPause()
-        // The window override belongs to the visible player only; never leak it to another app.
-        endPlayerSession()
+        CachedPlayerView.pauseAll()
     }
 
     override fun onDestroy() {
         destroyed = true
-        endPlayerSession()
+        CachedPlayerView.pauseAll()
         DownloadManager.attach(null)
         platformChannel?.setMethodCallHandler(null)
         platformChannel = null
@@ -243,23 +240,6 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    // Player session: only keeps the screen on while playing, never touches brightness.
-    private var addedKeepScreenOn = false
-
-    private fun beginPlayerSession(result: MethodChannel.Result) {
-        if (window.attributes.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON == 0) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            addedKeepScreenOn = true
-        }
-        result.success(null)
-    }
-
-    private fun endPlayerSession() {
-        if (addedKeepScreenOn) {
-            addedKeepScreenOn = false
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-    }
 
     companion object {
         private const val PENDING_SHARES = "nontonin.pendingShares"

@@ -60,7 +60,11 @@ kotlin {
 }
 
 dependencies {
-    // Test-only: the media mux regression runs on a device, nothing here ships in the APK.
+    implementation("androidx.media3:media3-exoplayer:1.9.2")
+    implementation("androidx.media3:media3-datasource:1.9.2")
+    implementation("androidx.media3:media3-database:1.9.2")
+    implementation("androidx.media3:media3-ui:1.9.2")
+    // Native cache and playback regressions run on Android.
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
