@@ -12,7 +12,7 @@ Fitur:
 - Tema Terang/Gelap/Sistem.
 - Koleksi berupa daftar terbaru lebih dahulu, dengan thumbnail, durasi, ukuran berkas, dan menu hapus. Ketuk thumbnail atau baris untuk memutar.
 
-Backend ekstraksi terpisah (Python stdlib + yt-dlp, repo `backend-nonton-yuks`) hanya menjawab deskriptor CDN. Android menyimpan media ke cache privat Media3; player membaca cache yang sama. Video dan audio terpisah diputar bersamaan tanpa menulis ulang seluruh video menjadi satu MP4. Setelah seluruh bagian tersimpan, pemutaran tidak membutuhkan jaringan. MP4 koleksi lama tetap dapat diputar.
+Backend ekstraksi terpisah (Python stdlib + yt-dlp, repo `backend-nonton-yuk`) hanya menjawab deskriptor CDN. Android menyimpan media ke cache privat Media3; player membaca cache yang sama. Video dan audio terpisah diputar bersamaan tanpa menulis ulang seluruh video menjadi satu MP4. Setelah seluruh bagian tersimpan, pemutaran tidak membutuhkan jaringan. MP4 koleksi lama tetap dapat diputar.
 
 ## Syarat
 
