@@ -114,4 +114,22 @@ void main() {
     expect(controller.probe('tanpa tautan'), throwsA(isA<ExtractionException>()));
     controller.dispose();
   });
+
+  test('refresh rejects empty and cross-platform replacement links locally', () async {
+    final events = StreamController<Object?>();
+    final controller = DownloadController(progressEvents: events.stream);
+    addTearDown(() async {
+      await events.close();
+      controller.dispose();
+    });
+    events.add({'id': 'cached', 'platform': 'youtube', 'state': 'paused'});
+    await Future<void>.delayed(Duration.zero);
+
+    await expectLater(controller.refreshLink('cached', url: ''),
+        throwsA(isA<ExtractionException>()));
+    await expectLater(
+        controller.refreshLink('cached', url: 'https://facebook.com/watch?v=123456789'),
+        throwsA(isA<ExtractionException>()));
+    expect(controller.items.single.state, TaskState.paused);
+  });
 }

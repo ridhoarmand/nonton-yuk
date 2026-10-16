@@ -81,15 +81,22 @@ class MainActivity : FlutterActivity() {
                     "probe" -> {
                         val url = (arguments?.get("url") as? String)?.trim().orEmpty()
                         val platform = (arguments?.get("platform") as? String)?.trim().orEmpty()
+                        val rawHeight = arguments?.get("height")
+                        val height = when (rawHeight) {
+                            null -> if (arguments?.containsKey("height") == true) null else 0
+                            is Int -> rawHeight.takeIf { it in 0..8192 }
+                            is Long -> rawHeight.takeIf { it in 0L..8192L }?.toInt()
+                            else -> null
+                        }
                         when {
-                            url.isEmpty() || !Platforms.known(platform) ->
+                            url.isEmpty() || !Platforms.known(platform) || height == null ->
                                 result.error("invalidArguments", "Tautan tidak valid.", null)
                             else -> executeIo(
                                 result,
                                 "probeFailed",
                                 "Video tidak dapat dibaca. Periksa tautan lalu coba lagi.",
                             ) {
-                                DownloadManager.probe(url, platform)
+                                DownloadManager.probe(url, platform, height)
                             }
                         }
                     }
@@ -110,6 +117,14 @@ class MainActivity : FlutterActivity() {
                     }
                     "resume" -> withId(result, arguments) { id ->
                         DownloadManager.resume(applicationContext, id)
+                        null
+                    }
+                    "refreshLink" -> withId(result, arguments) { id ->
+                        val rawUrl = arguments?.get("url")
+                        if (arguments?.containsKey("url") == true && rawUrl !is String) {
+                            throw BridgeException("invalidArguments", "Tautan tidak valid.")
+                        }
+                        DownloadManager.refreshLink(applicationContext, id, rawUrl as? String)
                         null
                     }
                     "networkType" -> {

@@ -153,7 +153,10 @@ class SavedMedia {
 
   bool get ready => state == TaskState.done && path != null;
 
-  bool get canPlay => state != TaskState.canceled && (ready || playable);
+  bool get refreshing => phase == 'refresh' &&
+      (state == TaskState.queued || state == TaskState.running);
+
+  bool get canPlay => !refreshing && state != TaskState.canceled && (ready || playable);
 
   bool get active =>
       state == TaskState.queued ||
@@ -166,8 +169,9 @@ class SavedMedia {
 
   /// Indonesian status text, folding [phase] into the running wording.
   String get statusLabel => switch (state) {
-        TaskState.queued => 'Menunggu antrean',
+        TaskState.queued => refreshing ? 'Menunggu verifikasi link' : 'Menunggu antrean',
         TaskState.running => switch (phase) {
+            'refresh' => 'Memverifikasi link',
             'video' => 'Mengunduh video',
             'audio' => 'Mengunduh audio',
             _ => 'Mengunduh',
@@ -288,9 +292,9 @@ Future<void> setSettings(AppSettings settings) => _guard(() async {
       await platformChannel.invokeMethod<Object?>('setSettings', settings.toMap());
     });
 
-Future<ProbeResult> probeLink(String url, String platformId) => _guard(() async {
+Future<ProbeResult> probeLink(String url, String platformId, {int height = 0}) => _guard(() async {
       final res = await platformChannel.invokeMapMethod<Object?, Object?>(
-          'probe', {'url': url, 'platform': platformId});
+          'probe', {'url': url, 'platform': platformId, if (height > 0) 'height': height});
       if (res == null) throw const ExtractionException('Tidak bisa membaca informasi video. Coba lagi.');
       return ProbeResult.fromMap(res);
     });
@@ -332,6 +336,10 @@ Future<void> pauseDownload(String id) => _guard(() async {
 
 Future<void> resumeDownload(String id) => _guard(() async {
       await platformChannel.invokeMethod<Object?>('resume', {'id': id});
+    });
+
+Future<void> refreshDownloadLink(String id, {String? url}) => _guard(() async {
+      await platformChannel.invokeMethod<Object?>('refreshLink', {'id': id, 'url': ?url});
     });
 
 /// wifi, cellular, or unknown: the mobile-data warning needs no exact subtype.

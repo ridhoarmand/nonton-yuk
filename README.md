@@ -1,4 +1,4 @@
-# Nonton Yuks
+# NontonYuk!
 
 Simpan video publik Facebook dan YouTube di ponsel untuk ditonton offline. Package Dart `nonton_yuks`, application ID Android `com.nonton.yuks`.
 

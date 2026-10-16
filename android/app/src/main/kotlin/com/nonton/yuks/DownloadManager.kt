@@ -42,6 +42,7 @@ object DownloadManager {
     private val main = Handler(Looper.getMainLooper())
     private class Run(val id: String) {
         @Volatile var job: MediaCache.Job? = null
+        @Volatile var refresh: MediaCache.RefreshJob? = null
         @Volatile var stopped = false
         @Volatile var deleted = false
         var startedAt = System.currentTimeMillis()
@@ -73,6 +74,15 @@ object DownloadManager {
                     entry["path"] = null
                     return@forEach
                 }
+                val refreshing = entry.text("refreshUrl") != null && entry.text("state") != STATE_DONE
+                if (refreshing) {
+                    entry["state"] = STATE_PAUSED
+                    entry["phase"] = "refresh"
+                    entry["etaSeconds"] = 0
+                    entry["speedBps"] = 0L
+                    entry["error"] = null
+                    entry["resumable"] = true
+                }
                 if (entry.text("state") in setOf(STATE_RUNNING, STATE_QUEUED, STATE_INTERRUPTED)) {
                     entry["state"] = STATE_PAUSED
                     entry["etaSeconds"] = 0
@@ -84,7 +94,7 @@ object DownloadManager {
                     entry["path"] = MediaCache.manifestPath(context, id)
                     entry["bytes"] = MediaCache.bytes(context, id)
                     entry["playable"] = MediaCache.isPlayable(context, id)
-                    if (MediaCache.isComplete(context, id)) {
+                    if (!refreshing && MediaCache.isComplete(context, id)) {
                         entry["state"] = STATE_DONE
                         entry["progress"] = 1.0
                         entry["error"] = null
@@ -108,11 +118,11 @@ object DownloadManager {
 
     fun list(context: Context): List<Map<String, Any?>> {
         init(context)
-        return synchronized(lock) { entries.map { HashMap<String, Any?>(it) } }
+        return synchronized(lock) { entries.map(::publicEntry) }
     }
 
-    fun probe(url: String, platform: String): Map<String, Any?> {
-        val result = ApiClient.resolve(url, platform)
+    fun probe(url: String, platform: String, height: Int = 0): Map<String, Any?> {
+        val result = ApiClient.resolve(url, platform, height)
         return mapOf(
             "id" to "${result.platform}_${result.videoId}", "title" to result.title,
             "uploader" to result.uploader, "platform" to result.platform,
@@ -166,6 +176,45 @@ object DownloadManager {
         return id
     }
 
+    fun refreshLink(context: Context, id: String, url: String? = null) {
+        init(context)
+        synchronized(lock) {
+            val index = entries.indexOfFirst { it["id"] == id }
+            val entry = entries.getOrNull(index)
+                ?: throw BridgeException("missingVideo", "Video tidak ada lagi di koleksi.")
+            if (runs.containsKey(id)) {
+                throw BridgeException("downloadStopping", "Unduhan masih dihentikan. Tunggu sebentar lalu coba lagi.")
+            }
+            val state = entry.text("state")
+            if ((state != STATE_PAUSED && state != STATE_FAILED && state != STATE_INTERRUPTED) ||
+                !VIDEO_ID.matches(entry.text("videoId").orEmpty())) {
+                throw BridgeException("invalidArguments", INVALID)
+            }
+            val platform = entry.text("platform").orEmpty()
+            val source = (url ?: entry.text("sourceUrl").orEmpty()).trim()
+            ApiClient.requireSourceUrl(platform, source)
+            entries[index] = HashMap(entry).apply {
+                this["refreshUrl"] = source
+                this["phase"] = "refresh"
+                this["state"] = STATE_QUEUED
+                this["resumable"] = true
+                this["error"] = null
+                this["etaSeconds"] = 0
+                this["speedBps"] = 0L
+            }
+            try {
+                DownloadStore.save(context, entries)
+            } catch (_: Exception) {
+                entries[index] = entry
+                throw BridgeException("refreshFailed", "Antrean tidak dapat disimpan. Coba perbarui link lagi.")
+            }
+            if (!queue.contains(id)) queue.addLast(id)
+        }
+        publish(context, id, false)
+        DownloadService.start(context)
+        pump()
+    }
+
     fun pause(context: Context, id: String) {
         init(context)
         val run = synchronized(lock) {
@@ -180,6 +229,7 @@ object DownloadManager {
             runs[id]?.also { it.stopped = true }
         }
         run?.job?.cancel()
+        run?.refresh?.cancel()
         publish(context, id, true)
     }
 
@@ -188,10 +238,15 @@ object DownloadManager {
         synchronized(lock) {
             val entry = entries.find { it["id"] == id } ?: return
             if (entry.text("state") !in setOf(STATE_PAUSED, STATE_INTERRUPTED, STATE_FAILED)) return
+            if (runs.containsKey(id)) {
+                throw BridgeException("downloadStopping", "Unduhan masih dihentikan. Tunggu sebentar lalu coba lagi.")
+            }
             if (entry["resumable"] != true) return
             entry["state"] = STATE_QUEUED
             entry["error"] = null
             entry["speedBps"] = 0L
+            entry["etaSeconds"] = 0
+            if (entry.text("refreshUrl") != null) entry["phase"] = "refresh"
             if (!queue.contains(id)) queue.addLast(id)
         }
         publish(context, id, true)
@@ -214,10 +269,13 @@ object DownloadManager {
             entry["etaSeconds"] = 0
             entry["speedBps"] = 0L
             entry["error"] = null
+            entry.remove("refreshUrl")
+            entry["phase"] = null
             runs[id]?.also { it.stopped = true }
+                .also { if (it == null) removeFiles(context, id) }
         }
         run?.job?.cancel()
-        if (run == null) removeFiles(context, id)
+        run?.refresh?.cancel()
         publish(context, id, true)
     }
 
@@ -227,9 +285,10 @@ object DownloadManager {
             entries.removeAll { it["id"] == id }
             queue.remove(id)
             runs[id]?.also { it.deleted = true; it.stopped = true }
+                .also { if (it == null) removeFiles(context, id) }
         }
         run?.job?.cancel()
-        if (run == null) removeFiles(context, id)
+        run?.refresh?.cancel()
         persist(context)
     }
 
@@ -251,7 +310,7 @@ object DownloadManager {
 
     fun active(): Map<String, Any?>? = synchronized(lock) {
         (entries.find { it.text("state") == STATE_RUNNING }
-            ?: entries.find { it.text("state") == STATE_QUEUED })?.let { HashMap<String, Any?>(it) }
+            ?: entries.find { it.text("state") == STATE_QUEUED })?.let(::publicEntry)
     }
 
     private fun work() {
@@ -271,23 +330,45 @@ object DownloadManager {
             val entry = entries.find { it["id"] == id } ?: return
             if (entry.text("state") != STATE_QUEUED) return
             entry["state"] = STATE_RUNNING
-            entry["phase"] = "download"
+            entry["phase"] = if (entry.text("refreshUrl") != null) "refresh" else "download"
             entry["error"] = null
             runs[id] = run
             HashMap<String, Any?>(entry)
         }
         publish(context, id, true)
         try {
-            if (recoverLegacyParts(context, run)) return
             val existing = MediaCache.exists(context, id)
+            val refreshUrl = snapshot.text("refreshUrl")
+            var resolved: Resolved? = null
+            if (refreshUrl != null) {
+                if (existing) {
+                    val refresh = MediaCache.newRefreshJob(context, id) { platform, height ->
+                        ApiClient.resolve(refreshUrl, platform, height)
+                    }
+                    run.refresh = refresh
+                    if (!writable(run)) { refresh.cancel(); return }
+                    acceptRefresh(context, run, refresh.run())
+                } else {
+                    resolved = ApiClient.resolve(refreshUrl, snapshot.text("platform").orEmpty(),
+                        snapshot["height"].asLong().toInt()).also {
+                        if (it.videoId != snapshot.text("videoId")) {
+                            throw BridgeException("videoChanged", VIDEO_CHANGED)
+                        }
+                    }
+                }
+            }
+            if (!writable(run)) return
+            if (recoverLegacyParts(context, run, resolved)) return
             if (!existing && legacyParts(context, id).isNotEmpty()) {
                 throw BridgeException("legacyPartial", "Sisa unduhan lama disimpan, tetapi metadata untuk melanjutkannya tidak lengkap. Tidak ada berkas yang dihapus. Batalkan hanya jika ingin mengunduh ulang.")
             }
-            val resolved = if (existing) null else ApiClient.resolve(
-                snapshot.text("sourceUrl").orEmpty(), snapshot.text("platform").orEmpty(),
-                snapshot["height"].asLong().toInt(),
-            ).also {
-                if (it.videoId != snapshot.text("videoId")) throw BridgeException("videoChanged", VIDEO_CHANGED)
+            if (!existing && resolved == null) {
+                resolved = ApiClient.resolve(
+                    snapshot.text("sourceUrl").orEmpty(), snapshot.text("platform").orEmpty(),
+                    snapshot["height"].asLong().toInt(),
+                ).also {
+                    if (it.videoId != snapshot.text("videoId")) throw BridgeException("videoChanged", VIDEO_CHANGED)
+                }
             }
             if (!writable(run)) return
             run.initialBytes = MediaCache.bytes(context, id)
@@ -296,9 +377,10 @@ object DownloadManager {
                 progress(context, run, bytes, total, playable)
             }
             run.job = job
+            if (refreshUrl != null && resolved != null) acceptRefresh(context, run, resolved)
             synchronized(lock) {
                 entries.find { it["id"] == id }?.let {
-                    if (!writable(run)) return@let
+                    if (run.deleted || runs[id] !== run || it.text("state") == STATE_CANCELED) return@let
                     it["path"] = MediaCache.manifestPath(context, id)
                     it["resumable"] = true
                 }
@@ -336,21 +418,36 @@ object DownloadManager {
             publish(context, id, true)
         } finally {
             run.job?.cancel()
+            run.refresh?.cancel()
             val cachedBytes = MediaCache.bytes(context, id)
             val cachedPlayable = MediaCache.isPlayable(context, id)
-            val remove = synchronized(lock) {
-                if (runs[id] === run) runs.remove(id)
+            synchronized(lock) {
                 val entry = entries.find { it["id"] == id }
                 if (entry != null && entry.text("state") != STATE_CANCELED && cachedBytes > 0L) {
                     entry["bytes"] = cachedBytes
                     entry["playable"] = cachedPlayable
                 }
-                run.deleted || entry?.text("state") == STATE_CANCELED
+                // Keep the stopping run registered until deletion finishes to protect a replacement task.
+                if (run.deleted || entry?.text("state") == STATE_CANCELED) removeFiles(context, id)
+                if (runs[id] === run) runs.remove(id)
             }
-            if (remove) removeFiles(context, id)
             persist(context)
             if (!run.deleted) publish(context, id, false)
         }
+    }
+
+    private fun acceptRefresh(context: Context, run: Run, resolved: Resolved) {
+        synchronized(lock) {
+            val entry = entries.find { it["id"] == run.id } ?: return
+            if (run.deleted || runs[run.id] !== run || entry.text("state") == STATE_CANCELED) return
+            entry["sourceUrl"] = resolved.sourceUrl
+            entry["canonicalUrl"] = ApiClient.canonicalSource(resolved.platform, resolved.sourceUrl)
+            entry.remove("refreshUrl")
+            entry["phase"] = if (entry.text("state") == STATE_DONE) null else "download"
+            entry["etaSeconds"] = 0
+            entry["speedBps"] = 0L
+        }
+        publish(context, run.id, true)
     }
 
     private fun writable(run: Run): Boolean = synchronized(lock) {
@@ -411,7 +508,7 @@ object DownloadManager {
     }
 
     /** Completed old tracks can play separately: no copying, merging, or re-downloading. */
-    private fun recoverLegacyParts(context: Context, run: Run): Boolean {
+    private fun recoverLegacyParts(context: Context, run: Run, refreshed: Resolved?): Boolean {
         if (MediaCache.exists(context, run.id)) return false
         val muxed = File(videos(context), "${run.id}.download.part")
         val video = File(videos(context), "${run.id}.video.part")
@@ -440,6 +537,11 @@ object DownloadManager {
             entry["resumable"] = false
             entry["phase"] = null
             entry["error"] = null
+            if (refreshed != null) {
+                entry["sourceUrl"] = refreshed.sourceUrl
+                entry["canonicalUrl"] = ApiClient.canonicalSource(refreshed.platform, refreshed.sourceUrl)
+                entry.remove("refreshUrl")
+            }
         }
         publish(context, run.id, true)
         return true
@@ -448,11 +550,14 @@ object DownloadManager {
     private fun publish(context: Context, id: String, save: Boolean) {
         if (save) persist(context)
         val entry = synchronized(lock) {
-            entries.find { it["id"] == id }?.let { HashMap<String, Any?>(it) }
+            entries.find { it["id"] == id }?.let(::publicEntry)
         } ?: return
         DownloadService.publish(context, entry, true)
         main.post { sink?.success(entry) }
     }
+
+    private fun publicEntry(entry: Map<String, Any?>): Map<String, Any?> =
+        HashMap<String, Any?>(entry).apply { remove("refreshUrl") }
 
     private fun persist(context: Context) {
         synchronized(lock) {

@@ -13,12 +13,14 @@ import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.ContentMetadata
 import androidx.media3.datasource.cache.ContentMetadataMutations
+import androidx.media3.datasource.cache.CacheSpan
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
@@ -49,9 +51,16 @@ object MediaCache {
     fun newJob(context: Context, id: String, resolved: Resolved?,
         onProgress: (bytes: Long, total: Long, playable: Boolean) -> Unit): Job =
         Job(engine(context).newJob(id, resolved, onProgress))
+    fun newRefreshJob(context: Context, id: String, resolve: (String, Int) -> Resolved): RefreshJob =
+        RefreshJob(engine(context).newRefreshJob(id, resolve))
 
     class Job internal constructor(private val delegate: CacheJob) {
         fun run() = delegate.run()
+        fun cancel() = delegate.cancel()
+    }
+
+    class RefreshJob internal constructor(private val delegate: CacheRefreshJob) {
+        fun run(): Resolved = delegate.run()
         fun cancel() = delegate.cancel()
     }
 }
@@ -61,6 +70,9 @@ internal const val CACHE_WINDOW = 2 * 1024 * 1024L
 private const val START_BUFFER = 64 * 1024L
 private const val MANIFEST_LIMIT = 8 * 1024 * 1024L
 private const val BAD_CACHE = "Data unduhan tidak dapat dibuka. Byte lama tetap tersimpan; jangan hapus jika masih diperlukan."
+private const val REFRESH_BUSY = "Tutup pemutar video ini sebelum memperbarui link."
+private const val REFRESH_MISMATCH = "Tautan baru tidak cocok dengan berkas tersimpan. Data lama tidak diubah."
+private const val VIDEO_CHANGED = "Video pada tautan ini sudah berbeda. Unduhan tersimpan tidak diubah."
 
 internal data class CachePart(val url: String, var length: Long = -1L,
     var etag: String? = null, var lastModified: String? = null,
@@ -139,6 +151,7 @@ internal class CacheEngine(
 ) {
     private val sessions = ConcurrentHashMap<String, CacheSession>()
     private val directory = File(root, "manifests").also { check(it.isDirectory || it.mkdirs()) }
+    private var closed = false
 
     internal fun taskKey(id: String): String {
         if (id.isEmpty() || id.length > 256 || id.any { it.code < 0x20 }) throw BridgeException("notFound", "Unduhan tidak ditemukan.")
@@ -152,6 +165,7 @@ internal class CacheEngine(
 
     @Synchronized
     internal fun session(id: String): CacheSession {
+        if (closed) throw IOException(CACHE_PAUSED)
         sessions[id]?.let { return it }
         val snapshot = try {
             manifest(id).openRead().use { input ->
@@ -164,6 +178,7 @@ internal class CacheEngine(
 
     @Synchronized
     fun newJob(id: String, resolved: Resolved?, onProgress: (Long, Long, Boolean) -> Unit): CacheJob {
+        if (closed) throw IOException(CACHE_PAUSED)
         if (resolved != null) {
             if (exists(id)) throw BridgeException("downloadFailed", CACHE_CHANGED)
             val snapshot = CacheSnapshot.from(resolved)
@@ -172,6 +187,69 @@ internal class CacheEngine(
         }
         val session = session(id)
         return session.newJob(onProgress)
+    }
+
+    fun newRefreshJob(id: String, resolve: (String, Int) -> Resolved): CacheRefreshJob =
+        CacheRefreshJob(this, id, resolve)
+
+    internal fun reserveRefresh(job: CacheRefreshJob): CacheSession {
+        val (session, cancel) = synchronized(this) {
+            job.checkCanceled()
+            if (job.started) throw IOException(CACHE_PAUSED)
+            job.started = true
+            val session = session(job.id)
+            val cancel = session.reserveRefresh(job)
+            job.session = session
+            session to cancel
+        }
+        cancel.forEach { runCatching { it() } }
+        job.checkCanceled()
+        return session
+    }
+
+    @Synchronized
+    internal fun attachRefresh(job: CacheRefreshJob, source: DataSource) {
+        checkRefresh(job)
+        job.upstream = source
+    }
+
+    @Synchronized
+    internal fun detachRefresh(job: CacheRefreshJob, source: DataSource) {
+        if (job.upstream === source) job.upstream = null
+    }
+
+    private fun checkRefresh(job: CacheRefreshJob): CacheSession {
+        job.checkCanceled()
+        val session = job.session
+        if (closed || session == null || sessions[job.id] !== session ||
+            !session.ownsRefresh(job) || !exists(job.id)) throw BridgeException("downloadCanceled", CACHE_PAUSED)
+        return session
+    }
+
+    @Synchronized
+    internal fun commitRefresh(job: CacheRefreshJob, candidate: CacheSnapshot) {
+        val previous = checkRefresh(job)
+        try { save(job.id, candidate) } catch (_: IOException) { throw BridgeException("downloadFailed", BAD_CACHE) }
+        previous.retireRefresh(job)
+        sessions[job.id] = CacheSession(this, job.id, candidate)
+        job.committed = true
+    }
+
+    private fun cancelRefreshLocked(job: CacheRefreshJob): DataSource? {
+        if (job.committed) return null
+        job.canceled = true
+        job.session?.releaseRefresh(job)
+        return job.upstream.also { job.upstream = null }
+    }
+
+    internal fun cancelRefresh(job: CacheRefreshJob) {
+        val source = synchronized(this) { cancelRefreshLocked(job) }
+        cancelUpstream(source)
+    }
+
+    @Synchronized
+    internal fun releaseRefresh(job: CacheRefreshJob) {
+        job.session?.releaseRefresh(job)
     }
 
     internal fun save(id: String, snapshot: CacheSnapshot) {
@@ -190,8 +268,10 @@ internal class CacheEngine(
     fun bytes(id: String): Long = if (exists(id)) session(id).bytes() else 0L
     fun isPlayable(id: String): Boolean = exists(id) && session(id).playable()
     fun isComplete(id: String): Boolean = exists(id) && session(id).complete()
+    @Synchronized
     fun source(id: String): MediaSource {
         val session = session(id)
+        session.checkPresent()
         val sources = session.snapshot.tracks.mapIndexed { index, _ ->
             ProgressiveMediaSource.Factory(DataSource.Factory { session.stream(index) })
                 .createMediaSource(MediaItem.fromUri("cache://" + taskKey(id) + "/" + index))
@@ -199,21 +279,37 @@ internal class CacheEngine(
         return if (sources.size == 1) sources.single() else MergingMediaSource(*sources.toTypedArray())
     }
 
-    @Synchronized
     fun remove(id: String) {
-        sessions.remove(id)?.remove()
-        val prefix = "ny-v1:" + taskKey(id) + ":"
-        cache.keys.filter { it.startsWith(prefix) }.forEach { cache.removeResource(it) }
-        manifest(id).delete()
+        val source = synchronized(this) {
+            val session = sessions.remove(id)
+            val source = session?.refreshJob()?.let { cancelRefreshLocked(it) }
+            session?.remove()
+            val prefix = "ny-v1:" + taskKey(id) + ":"
+            cache.keys.filter { it.startsWith(prefix) }.forEach { cache.removeResource(it) }
+            manifest(id).delete()
+            source
+        }
+        cancelUpstream(source)
     }
 
     internal fun upstream(request: CacheUpstreamRequest): DataSource = upstreamFactory.create(request)
 
     internal fun close() {
-        sessions.values.forEach { it.shutdown() }
-        sessions.clear()
+        val retired = synchronized(this) {
+            closed = true
+            sessions.values.map { session ->
+                val source = session.refreshJob()?.let { cancelRefreshLocked(it) }
+                session.retire()
+                session to source
+            }.also { sessions.clear() }
+        }
+        retired.forEach { (session, source) -> cancelUpstream(source); session.shutdown() }
         cache.release()
     }
+}
+
+private fun cancelUpstream(source: DataSource?) {
+    runCatching { if (source is CancelableUpstream) source.cancel() else source?.close() }
 }
 
 internal class CacheSession(private val engine: CacheEngine, val id: String, val snapshot: CacheSnapshot) {
@@ -224,20 +320,51 @@ internal class CacheSession(private val engine: CacheEngine, val id: String, val
     private val progressSignal = Object()
     @Volatile private var removed = false
     @Volatile private var currentJob: CacheJob? = null
+    @Volatile private var refresh: CacheRefreshJob? = null
     private val prefix = "ny-v1:" + engine.taskKey(id) + ":"
     internal fun key(track: Int, part: Int): String = prefix + snapshot.tracks[track].kind + ":" + part
 
     @Synchronized
     fun newJob(onProgress: (Long, Long, Boolean) -> Unit): CacheJob {
+        if (refresh != null) throw BridgeException("refreshBusy", REFRESH_BUSY)
         if (removed || currentJob?.running == true) throw BridgeException("downloadFailed", "Unduhan ini sedang berjalan.")
         return CacheJob(this, onProgress).also { currentJob = it }
     }
 
     @Synchronized
     internal fun begin(job: CacheJob) {
+        if (refresh != null) throw BridgeException("refreshBusy", REFRESH_BUSY)
         if (removed || currentJob !== job || job.canceled) throw BridgeException("downloadCanceled", CACHE_PAUSED)
         job.running = true
         gate.enable()
+    }
+
+    @Synchronized
+    internal fun reserveRefresh(job: CacheRefreshJob): List<() -> Unit> {
+        if (removed || refresh != null || currentJob?.running == true || sinks.isNotEmpty() || readers.isNotEmpty()) {
+            throw BridgeException("refreshBusy", REFRESH_BUSY)
+        }
+        refresh = job
+        val cancel = gate.detach().toMutableList()
+        windows.values.forEach { pool -> cancel.add { pool.close() } }
+        windows.clear()
+        return cancel
+    }
+
+    @Synchronized internal fun ownsRefresh(job: CacheRefreshJob): Boolean = !removed && refresh === job
+    @Synchronized internal fun refreshJob(): CacheRefreshJob? = refresh
+    @Synchronized internal fun releaseRefresh(job: CacheRefreshJob) { if (refresh === job) refresh = null }
+    @Synchronized internal fun retireRefresh(job: CacheRefreshJob) {
+        check(refresh === job)
+        refresh = null
+        removed = true
+    }
+    @Synchronized internal fun retire() { removed = true; refresh = null }
+
+    @Synchronized
+    private fun sinkOpened(sink: DurableCacheSink) {
+        checkPresent()
+        sinks.add(sink)
     }
 
     internal fun stop(job: CacheJob) {
@@ -273,7 +400,7 @@ internal class CacheSession(private val engine: CacheEngine, val id: String, val
     @Synchronized
     internal fun metadata(trackIndex: Int, partIndex: Int, response: CacheResponse) {
         val part = snapshot.tracks[trackIndex].parts[partIndex]
-        if (removed) throw IOException(CACHE_PAUSED)
+        checkPresent()
         if (part.length >= 0L && response.length >= 0L && part.length != response.length ||
             part.etag != null && part.etag != response.etag ||
             part.etag == null && part.lastModified != null && part.lastModified != response.lastModified
@@ -306,7 +433,7 @@ internal class CacheSession(private val engine: CacheEngine, val id: String, val
         return CacheDataSource.Factory().setCache(engine.cache)
             .setFlags(CacheDataSource.FLAG_BLOCK_ON_CACHE)
             .setCacheWriteDataSinkFactory(DataSink.Factory {
-                DurableCacheSink(engine.cache, { checkPresent(); sinks.add(it) },
+                DurableCacheSink(engine.cache, { sinkOpened(it) },
                     { sinks.remove(it) }, { checkPresent() }, { signalProgress() })
             })
             .setUpstreamDataSourceFactory(DataSource.Factory {
@@ -331,9 +458,17 @@ internal class CacheSession(private val engine: CacheEngine, val id: String, val
         .setUri(snapshot.tracks[track].parts[part].url).setKey(key(track, part))
         .setPosition(offset).setLength(length).build()
 
-    internal fun checkPresent() { if (removed) throw IOException(CACHE_PAUSED) }
-    internal fun stream(trackIndex: Int): DataSource = CacheStreamDataSource(this, trackIndex).also { readers.add(it) }
+    internal fun checkPresent() {
+        if (removed) throw IOException(CACHE_PAUSED)
+        if (refresh != null) throw BridgeException("refreshBusy", REFRESH_BUSY)
+    }
+    @Synchronized
+    internal fun stream(trackIndex: Int): DataSource {
+        checkPresent()
+        return CacheStreamDataSource(this, trackIndex).also { readers.add(it) }
+    }
     internal fun readerClosed(reader: CacheStreamDataSource) { readers.remove(reader) }
+    @Synchronized
     internal fun readerOpened(reader: CacheStreamDataSource) { checkPresent(); readers.add(reader) }
 
     internal fun signalProgress() { synchronized(progressSignal) { progressSignal.notifyAll() } }
@@ -398,6 +533,169 @@ internal class CacheSession(private val engine: CacheEngine, val id: String, val
             }
         }
         return null
+    }
+}
+
+internal class CacheRefreshJob(
+    private val engine: CacheEngine,
+    internal val id: String,
+    private val resolve: (String, Int) -> Resolved,
+) {
+    @Volatile internal var canceled = false
+    @Volatile internal var committed = false
+    internal var started = false
+    internal var session: CacheSession? = null
+    internal var upstream: DataSource? = null
+
+    fun cancel() = engine.cancelRefresh(this)
+
+    fun run(): Resolved {
+        try {
+            val previous = engine.reserveRefresh(this)
+            checkCanceled()
+            val resolved = resolve(previous.snapshot.platform, previous.snapshot.height)
+            checkCanceled()
+            val candidate = candidate(previous.snapshot, resolved)
+            val cached = ByteArray(64 * 1024)
+            val remote = ByteArray(64 * 1024)
+            candidate.tracks.forEachIndexed { track, value -> value.parts.indices.forEach { part ->
+                checkCanceled()
+                verifyPart(previous, candidate, track, part, cached, remote)
+            } }
+            engine.commitRefresh(this, candidate)
+            return resolved
+        } catch (error: Exception) {
+            checkCanceled()
+            if (error is BridgeException) throw error
+            if (error is IOException && error.message == CACHE_CHANGED) mismatch()
+            throw BridgeException("downloadFailed",
+                "Link tidak dapat diverifikasi. Data lama tetap tersimpan; coba lagi setelah jaringan pulih.")
+        } finally { engine.releaseRefresh(this) }
+    }
+
+    internal fun checkCanceled() {
+        if (canceled && !committed) throw BridgeException("downloadCanceled", CACHE_PAUSED)
+    }
+
+    private fun mismatch(): Nothing = throw BridgeException("refreshMismatch", REFRESH_MISMATCH)
+
+    private fun candidate(previous: CacheSnapshot, resolved: Resolved): CacheSnapshot {
+        if (resolved.videoId != previous.videoId) throw BridgeException("videoChanged", VIDEO_CHANGED)
+        if (resolved.platform != previous.platform || previous.height > 0 && resolved.height != previous.height ||
+            resolved.streams.size != previous.tracks.size ||
+            resolved.streams.map { it.kind }.toSet() != previous.tracks.map { it.kind }.toSet()) mismatch()
+        val parsed = CacheSnapshot.from(resolved)
+        val byKind = parsed.tracks.associateBy { it.kind }
+        return parsed.copy(tracks = previous.tracks.map { old ->
+            val fresh = byKind[old.kind] ?: mismatch()
+            if (fresh.parts.size != old.parts.size) mismatch()
+            fresh
+        })
+    }
+
+    private fun verifyPart(previous: CacheSession, candidate: CacheSnapshot, trackIndex: Int, partIndex: Int,
+        cached: ByteArray, remote: ByteArray) {
+        val track = candidate.tracks[trackIndex]
+        val part = track.parts[partIndex]
+        val old = previous.snapshot.tracks[trackIndex].parts[partIndex]
+        val spans = engine.cache.getCachedSpans(previous.key(trackIndex, partIndex)).toList()
+        val cachedEnd = spans.lastOrNull()?.let { Math.addExact(it.position, it.length) } ?: 0L
+        var bound = false
+        var source: DataSource? = null
+        fun open(position: Long, length: Long) {
+            checkCanceled()
+            val expected = CacheResponse(if (bound) part.length else old.length, part.etag, part.lastModified,
+                part.rangeSupported)
+            val current = engine.upstream(CacheUpstreamRequest(candidate.platform, track.headers, expected) { response ->
+                checkCanceled()
+                if (old.length >= 0L && old.length != response.length ||
+                    response.length >= 0L && response.length < cachedEnd ||
+                    bound && (part.length >= 0L && part.length != response.length ||
+                        part.etag != response.etag ||
+                        part.etag == null && part.lastModified != response.lastModified)) throw IOException(CACHE_CHANGED)
+                if (response.length >= 0L) part.length = response.length
+                part.etag = response.etag
+                part.lastModified = response.lastModified
+                part.rangeSupported = response.rangeSupported
+                bound = true
+            })
+            source = current
+            engine.attachRefresh(this, current)
+            current.open(DataSpec.Builder().setUri(part.url).setPosition(position).setLength(length).build())
+            if (!bound) mismatch()
+        }
+        fun close() {
+            val current = source ?: return
+            source = null
+            engine.detachRefresh(this, current)
+            current.close()
+        }
+        try {
+            if (spans.isEmpty()) {
+                open(0L, 1L)
+                readRemote(checkNotNull(source), remote, 1)
+                return
+            }
+            var index = 0
+            while (index < spans.size) {
+                var until = index + 1
+                var end = Math.addExact(spans[index].position, spans[index].length)
+                while (until < spans.size && spans[until].position == end) {
+                    end = Math.addExact(end, spans[until].length)
+                    until++
+                }
+                open(spans[index].position, end - spans[index].position)
+                // Validators identify a representation only at the same URL, never across refreshed CDN URLs.
+                if (old.url == part.url && old.length >= 0L && part.length == old.length &&
+                    (old.etag != null && part.etag == old.etag ||
+                        old.etag == null && part.etag == null && old.lastModified != null && part.lastModified == old.lastModified)) return
+                if (part.rangeSupported == false) until = spans.size
+                var position = spans[index].position
+                while (index < until) {
+                    val span = spans[index]
+                    var gap = span.position - position
+                    while (gap > 0L) {
+                        val count = min(gap, remote.size.toLong()).toInt()
+                        readRemote(checkNotNull(source), remote, count)
+                        gap -= count
+                    }
+                    compareSpan(span, checkNotNull(source), cached, remote)
+                    position = Math.addExact(span.position, span.length)
+                    index++
+                }
+                close()
+            }
+        } finally { close() }
+    }
+
+    private fun compareSpan(span: CacheSpan, source: DataSource, cached: ByteArray, remote: ByteArray) {
+        FileInputStream(span.file ?: throw IOException(BAD_CACHE)).use { input ->
+            var remaining = span.length
+            while (remaining > 0L) {
+                checkCanceled()
+                val count = min(remaining, cached.size.toLong()).toInt()
+                var offset = 0
+                while (offset < count) {
+                    val read = input.read(cached, offset, count - offset)
+                    if (read <= 0) mismatch()
+                    offset += read
+                }
+                readRemote(source, remote, count)
+                for (index in 0 until count) if (cached[index] != remote[index]) mismatch()
+                remaining -= count
+            }
+        }
+    }
+
+    private fun readRemote(source: DataSource, buffer: ByteArray, count: Int) {
+        var offset = 0
+        while (offset < count) {
+            checkCanceled()
+            val read = source.read(buffer, offset, count - offset)
+            if (read <= 0) mismatch()
+            offset += read
+        }
+        checkCanceled()
     }
 }
 
@@ -476,8 +774,14 @@ internal class NetworkGate {
     }
     @Synchronized fun check(lease: Long) { if (!enabled || lease != generation) throw IOException(CACHE_PAUSED) }
     @Synchronized fun unregister(owner: Any) { readers.remove(owner) }
+    @Synchronized
+    fun detach(): List<() -> Unit> {
+        enabled = false
+        generation++
+        return readers.values.toList().also { readers.clear() }
+    }
     fun disable() {
-        val cancel = synchronized(this) { enabled = false; generation++; readers.values.toList().also { readers.clear() } }
+        val cancel = detach()
         cancel.forEach { runCatching { it() } }
     }
 }

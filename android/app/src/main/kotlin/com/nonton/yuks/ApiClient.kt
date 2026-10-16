@@ -222,7 +222,8 @@ object ApiClient {
             else -> throw bad()
         }
         if (height < 0) throw bad()
-        if (requestedHeight > 0 && height != requestedHeight) throw bad()
+        if (requestedHeight > 0 && height != requestedHeight) throw BridgeException(
+            "qualityUnavailable", "Resolusi yang dipilih tidak tersedia lagi. Pilih resolusi lain.")
         val heights = (root.opt("heights") as? JSONArray)?.let { array ->
             (0 until array.length()).map { index ->
                 (array.opt(index) as? Number)?.toInt()?.takeIf { it > 0 } ?: throw bad()

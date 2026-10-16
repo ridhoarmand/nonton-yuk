@@ -65,10 +65,11 @@ class MediaCacheTest {
 
     private fun reopen() { engine.close(); engine = openEngine() }
 
-    private fun descriptor(vararg tracks: Pair<String, List<String>>): Resolved = Resolved(
-        platform = "youtube", videoId = "cache_test1", sourceUrl = "https://www.youtube.com/watch?v=cache_test1",
-        title = "Cache test", uploader = null, durationMs = 1_000L, thumbnailUrl = null, height = 360,
-        heights = listOf(360), approxBytes = 0L,
+    private fun descriptor(vararg tracks: Pair<String, List<String>>, videoId: String = "cache_test1",
+        height: Int = 360, platform: String = "youtube"): Resolved = Resolved(
+        platform = platform, videoId = videoId, sourceUrl = "https://www.youtube.com/watch?v=$videoId",
+        title = "Cache test", uploader = null, durationMs = 1_000L, thumbnailUrl = null, height = height,
+        heights = listOf(height), approxBytes = 0L,
         streams = tracks.map { (kind, parts) -> Stream(kind, parts, mapOf("User-Agent" to "CacheTest"), 0L) },
     )
 
@@ -87,6 +88,346 @@ class MediaCacheTest {
                 out.write(buffer, 0, count)
             }
         } finally { source.close() }
+    }
+
+    private fun seed(resolved: Resolved, vararg spans: Triple<Int, Long, Int>) {
+        engine.newJob("task", resolved) { _, _, _ -> }
+        val session = engine.session("task")
+        resolved.streams.forEachIndexed { track, stream -> stream.parts.forEachIndexed { part, url ->
+            session.metadata(track, part, CacheResponse(server.data[url]!!.size.toLong(), server.etag, server.lastModified, true))
+        } }
+        spans.forEach { (track, position, size) ->
+            val key = session.key(track, 0)
+            val hole = engine.cache.startReadWrite(key, position, size.toLong())
+            try {
+                val file = engine.cache.startFile(key, position, size.toLong())
+                java.io.FileOutputStream(file).use { output ->
+                    output.write(server.data[resolved.streams[track].parts[0]]!!, position.toInt(), size)
+                    output.fd.sync()
+                }
+                engine.cache.commitFile(file, size.toLong())
+            } finally { engine.cache.releaseHoleSpan(hole) }
+        }
+    }
+
+    private fun expectRefreshFailure(code: String, action: () -> Unit) {
+        try { action(); fail("refresh must fail with $code") }
+        catch (error: BridgeException) { assertEquals(code, error.code) }
+    }
+
+    @Test fun sameUrlCanUseCalibratedLastModifiedButNewUrlMustCompareBytes() {
+        server.etag = null
+        server.lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
+        val old = resource("modified-old", (CACHE_CHUNK * 2).toInt())
+        val fresh = server.add("modified-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(old)) }.run()
+        assertEquals(0L, server.served.get())
+        engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+        assertEquals(64 * 1024L, server.served.get())
+        assertEquals(64 * 1024L, engine.bytes("task"))
+    }
+
+    @Test fun unchangedUrlAndStrongValidatorUseMetadataButChangedValidatorChecksBytes() {
+        val media = resource("same-url", (CACHE_CHUNK * 3).toInt())
+        seed(descriptor("muxed" to listOf(media)), Triple(0, 0L, (CACHE_CHUNK * 2).toInt()))
+        val refresh = engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(media)) }
+        val result = refresh.run()
+        refresh.cancel()
+        assertEquals("cache_test1", result.videoId)
+        assertEquals(0L, server.served.get())
+        assertEquals(1, server.requests.size)
+        server.etag = "\"new-validator\""
+        engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(media)) }.run()
+        assertEquals(CACHE_CHUNK * 2, server.served.get())
+        assertEquals(CACHE_CHUNK * 2, engine.bytes("task"))
+    }
+
+    @Test fun unknownOldHeightAndLengthStillRequireEveryStoredByteToMatch() {
+        val old = resource("unknown-old", (CACHE_CHUNK * 3).toInt())
+        val fresh = server.add("unknown-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old), height = 0), Triple(0, CACHE_CHUNK, 64 * 1024))
+        val previous = engine.session("task").snapshot
+        previous.tracks.single().parts.single().length = -1L
+        engine.save("task", previous)
+        server.data[fresh]!![CACHE_CHUNK.toInt() + 3] = 0
+        expectRefreshFailure("refreshMismatch") {
+            engine.newRefreshJob("task") { _, height ->
+                assertEquals(0, height)
+                descriptor("muxed" to listOf(fresh), height = 720)
+            }.run()
+        }
+        server.data[fresh] = server.data[old]!!.clone()
+        engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh), height = 720) }.run()
+        assertEquals(720, engine.session("task").snapshot.height)
+        assertEquals(64 * 1024L, engine.bytes("task"))
+    }
+
+    @Test fun refreshCancellationBeforeRunNeverResolvesOrReserves() {
+        val old = resource("before-run", 128 * 1024)
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        val refresh = engine.newRefreshJob("task") { _, _ -> throw AssertionError("canceled resolve") }
+        refresh.cancel()
+        expectRefreshFailure("downloadCanceled") { refresh.run() }
+        assertArrayEquals(server.data[old]!!.copyOfRange(0, 64 * 1024), read(0, 0L, 64 * 1024L))
+    }
+
+    @Test fun refreshChangesUrlsWithoutChangingKeysOrBytesThenResumesAfterRestart() {
+        val old = resource("refresh-old", (CACHE_CHUNK * 4 + 7).toInt())
+        val fresh = server.add("refresh-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, CACHE_CHUNK.toInt()),
+            Triple(0, CACHE_CHUNK * 2, CACHE_CHUNK.toInt()))
+        val saved = engine.bytes("task")
+        val keys = engine.cache.keys.toSet()
+        val result = descriptor("muxed" to listOf(fresh))
+        engine.newRefreshJob("task") { platform, height ->
+            assertEquals("youtube", platform)
+            assertEquals(360, height)
+            result
+        }.run()
+        assertEquals(saved, engine.bytes("task"))
+        assertEquals(keys, engine.cache.keys)
+        assertEquals(saved, server.served.get())
+        assertEquals(listOf(0L, CACHE_CHUNK * 2), server.requests.map { it.position })
+        reopen()
+        assertEquals(fresh, engine.session("task").snapshot.tracks.single().parts.single().url)
+        val firstDownload = server.requests.size
+        engine.newJob("task", null) { _, _, _ -> }.run()
+        assertTrue(server.requests.drop(firstDownload).all { it.url == fresh })
+        assertEquals(CACHE_CHUNK, server.requests[firstDownload].position)
+        assertEquals(server.data[old]!!.size.toLong(), engine.bytes("task"))
+        server.online = false
+        assertArrayEquals(server.data[old], read(0))
+    }
+
+    @Test fun changedUrlChecksEveryCachedByteEvenWhenEtagsMatchOrDisappear() {
+        val old = resource("far-old", (CACHE_CHUNK * 5).toInt())
+        val fresh = server.add("far-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, (CACHE_CHUNK * 2).toInt()),
+            Triple(0, CACHE_CHUNK * 4, 128 * 1024))
+        val original = File(engine.manifestPath("task")).readBytes()
+        val saved = engine.bytes("task")
+        listOf("\"original\"", "\"changed\"", null).forEach { validator ->
+            server.etag = validator
+            listOf(CACHE_CHUNK.toInt() + 19, (CACHE_CHUNK * 4).toInt() + 31).forEach { offset ->
+                server.data[fresh] = server.data[old]!!.clone().also { it[offset] = (it[offset].toInt() xor 1).toByte() }
+                expectRefreshFailure("refreshMismatch") {
+                    engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+                }
+                assertEquals(saved, engine.bytes("task"))
+                assertArrayEquals(original, File(engine.manifestPath("task")).readBytes())
+                assertArrayEquals(server.data[old]!!.copyOfRange(offset, offset + 1), read(0, offset.toLong(), 1L))
+            }
+        }
+    }
+
+    @Test fun refreshMergesAdjacentSpansAndNoRangeSkipsHolesInOneBody() {
+        val old = resource("sequential-old", (CACHE_CHUNK * 5).toInt())
+        val fresh = server.add("sequential-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, CACHE_CHUNK, 64 * 1024),
+            Triple(0, CACHE_CHUNK + 64 * 1024, 64 * 1024), Triple(0, CACHE_CHUNK * 3, 64 * 1024))
+        val saved = engine.bytes("task")
+        server.ignoreRanges = true
+        engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+        assertEquals(1, server.requests.size)
+        assertEquals(CACHE_CHUNK, server.requests.single().position)
+        assertEquals(128 * 1024L, server.requests.single().length)
+        assertEquals(CACHE_CHUNK * 3 + 64 * 1024, server.served.get())
+        assertEquals(saved, engine.bytes("task"))
+        assertFalse(engine.cache.isCached(engine.session("task").key(0, 0), CACHE_CHUNK * 2, 1L))
+    }
+
+    @Test fun refreshMatchesTrackKindsAndPreflightsUncachedPartsWithoutCachingThem() {
+        val video = resource("kind-video", 128 * 1024)
+        val audio = resource("kind-audio", 64 * 1024)
+        val freshVideo = server.add("fresh-video", server.data[video]!!.clone())
+        val freshAudio = server.add("fresh-audio", server.data[audio]!!.clone())
+        seed(descriptor("video" to listOf(video), "audio" to listOf(audio)), Triple(0, 0L, 64 * 1024))
+        engine.newRefreshJob("task") { _, _ ->
+            descriptor("audio" to listOf(freshAudio), "video" to listOf(freshVideo))
+        }.run()
+        assertEquals(listOf("video", "audio"), engine.session("task").snapshot.tracks.map { it.kind })
+        assertEquals(listOf(freshVideo, freshAudio), server.requests.map { it.url })
+        assertEquals(1L, server.requests.last().length)
+        assertEquals(64 * 1024L, engine.bytes("task"))
+        assertEquals(0L, engine.cache.getCachedBytes(engine.session("task").key(1, 0), 0L, Long.MAX_VALUE))
+    }
+
+    @Test fun refreshRejectsChangedIdentityStructureAndLengthWithoutReplacingManifest() {
+        val old = resource("structure-old", (CACHE_CHUNK * 2).toInt())
+        val fresh = server.add("structure-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        val original = File(engine.manifestPath("task")).readBytes()
+        val result = descriptor("muxed" to listOf(fresh))
+        listOf(
+            "videoChanged" to descriptor("muxed" to listOf(fresh), videoId = "another_video"),
+            "refreshMismatch" to descriptor("muxed" to listOf(fresh), height = 720),
+            "refreshMismatch" to descriptor("muxed" to listOf(fresh, fresh)),
+            "refreshMismatch" to descriptor("video" to listOf(fresh), "audio" to listOf(fresh)),
+        ).forEach { (code, candidate) ->
+            expectRefreshFailure(code) { engine.newRefreshJob("task") { _, _ -> candidate }.run() }
+            assertArrayEquals(original, File(engine.manifestPath("task")).readBytes())
+        }
+        server.data[fresh] = server.data[old]!!.copyOf(32 * 1024)
+        expectRefreshFailure("refreshMismatch") { engine.newRefreshJob("task") { _, _ -> result }.run() }
+        assertArrayEquals(original, File(engine.manifestPath("task")).readBytes())
+        assertEquals(64 * 1024L, engine.bytes("task"))
+    }
+
+    @Test fun refreshBindsValidatorAcrossRangesAndPreservesOldManifestOnNetworkOrEofFailure() {
+        val old = resource("validator-old", (CACHE_CHUNK * 4).toInt())
+        val fresh = server.add("validator-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024), Triple(0, CACHE_CHUNK * 3, 64 * 1024))
+        val original = File(engine.manifestPath("task")).readBytes()
+        server.onOpen = { if (it.position > 0L) server.etag = "\"changed-mid-refresh\"" }
+        expectRefreshFailure("refreshMismatch") {
+            engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+        }
+        server.onOpen = {}
+        server.failAfter = server.served.get()
+        expectRefreshFailure("downloadFailed") {
+            engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+        }
+        server.failAfter = Long.MAX_VALUE
+        server.shortAfter = server.served.get()
+        expectRefreshFailure("refreshMismatch") {
+            engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+        }
+        assertArrayEquals(original, File(engine.manifestPath("task")).readBytes())
+        assertEquals(128 * 1024L, engine.bytes("task"))
+        reopen()
+        server.online = false
+        assertArrayEquals(server.data[old]!!.copyOfRange(0, 64 * 1024), read(0, 0L, 64 * 1024L))
+    }
+
+    @Test fun refreshReservationBlocksPlayersAndJobsBeforeResolveAndCancelReleasesIt() {
+        val old = resource("reserve-old", (CACHE_CHUNK * 2).toInt())
+        val fresh = server.add("reserve-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        val oldSession = engine.session("task")
+        val pendingJob = engine.newJob("task", null) { _, _, _ -> }
+        val lateReader = oldSession.stream(0).also { it.close() }
+        val resolving = CountDownLatch(1)
+        val resolved = CountDownLatch(1)
+        val refresh = engine.newRefreshJob("task") { _, _ ->
+            resolving.countDown()
+            assertTrue(resolved.await(5, TimeUnit.SECONDS))
+            descriptor("muxed" to listOf(fresh))
+        }
+        val failure = AtomicReference<Throwable?>()
+        val worker = Thread { try { refresh.run() } catch (error: Throwable) { failure.set(error) } }
+        worker.start()
+        try {
+            assertTrue(resolving.await(5, TimeUnit.SECONDS))
+            expectRefreshFailure("refreshBusy") { engine.source("task") }
+            expectRefreshFailure("refreshBusy") { oldSession.stream(0) }
+            expectRefreshFailure("refreshBusy") { lateReader.open(DataSpec.Builder().setUri(uri()).build()) }
+            expectRefreshFailure("refreshBusy") { engine.newJob("task", null) { _, _, _ -> } }
+            expectRefreshFailure("refreshBusy") { pendingJob.run() }
+            refresh.cancel()
+            assertArrayEquals(server.data[old]!!.copyOfRange(0, 64 * 1024), read(0, 0L, 64 * 1024L))
+            val nextResolving = CountDownLatch(1)
+            val nextResolved = CountDownLatch(1)
+            val nextFailure = AtomicReference<Throwable?>()
+            val next = engine.newRefreshJob("task") { _, _ ->
+                nextResolving.countDown()
+                assertTrue(nextResolved.await(5, TimeUnit.SECONDS))
+                descriptor("muxed" to listOf(fresh))
+            }
+            val nextWorker = Thread { try { next.run() } catch (error: Throwable) { nextFailure.set(error) } }
+            nextWorker.start()
+            try {
+                assertTrue(nextResolving.await(5, TimeUnit.SECONDS))
+                resolved.countDown()
+                worker.join(5_000)
+                expectRefreshFailure("refreshBusy") { engine.source("task") }
+            } finally { nextResolved.countDown(); nextWorker.join(5_000) }
+            assertFalse(nextWorker.isAlive)
+            nextFailure.get()?.let { throw AssertionError(it) }
+        } finally { resolved.countDown(); worker.join(5_000) }
+        assertFalse(worker.isAlive)
+        assertEquals("downloadCanceled", (failure.get() as BridgeException).code)
+        assertEquals(fresh, engine.session("task").snapshot.tracks.single().parts.single().url)
+    }
+
+    @Test fun refreshRejectsAnActivePlayerOrDownloadWithoutResolving() {
+        val old = resource("busy-old", (CACHE_CHUNK * 2).toInt())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        val calls = AtomicLong()
+        val reader = engine.session("task").stream(0)
+        try {
+            expectRefreshFailure("refreshBusy") {
+                engine.newRefreshJob("task") { _, _ -> calls.incrementAndGet(); descriptor("muxed" to listOf(old)) }.run()
+            }
+            assertEquals(0L, calls.get())
+        } finally { reader.close() }
+        server.blockAfter = 0L
+        val download = engine.newJob("task", null) { _, _, _ -> }
+        val worker = Thread { runCatching { download.run() } }
+        worker.start()
+        try {
+            assertTrue(server.blocked.await(5, TimeUnit.SECONDS))
+            expectRefreshFailure("refreshBusy") {
+                engine.newRefreshJob("task") { _, _ -> calls.incrementAndGet(); descriptor("muxed" to listOf(old)) }.run()
+            }
+            assertEquals(0L, calls.get())
+        } finally { download.cancel(); worker.join(5_000) }
+    }
+
+    @Test fun cancelRefreshInterruptsUpstreamAndDeleteCannotBeResurrectedByLateResolve() {
+        val old = resource("cancel-old", (CACHE_CHUNK * 2).toInt())
+        val fresh = server.add("cancel-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 128 * 1024))
+        val original = File(engine.manifestPath("task")).readBytes()
+        server.blockAfter = 64 * 1024L
+        val refresh = engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }
+        val failure = AtomicReference<Throwable?>()
+        val worker = Thread { try { refresh.run() } catch (error: Throwable) { failure.set(error) } }
+        worker.start()
+        assertTrue(server.blocked.await(5, TimeUnit.SECONDS))
+        refresh.cancel()
+        worker.join(5_000)
+        assertFalse(worker.isAlive)
+        assertEquals("downloadCanceled", (failure.get() as BridgeException).code)
+        assertEquals(128 * 1024L, engine.bytes("task"))
+        assertArrayEquals(original, File(engine.manifestPath("task")).readBytes())
+        val resolving = CountDownLatch(1)
+        val releaseResolve = CountDownLatch(1)
+        val late = engine.newRefreshJob("task") { _, _ ->
+            resolving.countDown()
+            assertTrue(releaseResolve.await(5, TimeUnit.SECONDS))
+            descriptor("muxed" to listOf(fresh))
+        }
+        val lateWorker = Thread { runCatching { late.run() } }
+        lateWorker.start()
+        assertTrue(resolving.await(5, TimeUnit.SECONDS))
+        engine.remove("task")
+        releaseResolve.countDown()
+        lateWorker.join(5_000)
+        assertFalse(lateWorker.isAlive)
+        assertFalse(engine.exists("task"))
+        assertTrue(engine.cache.keys.isEmpty())
+    }
+
+    @Test fun atomicManifestFailureKeepsOldManifestAndReleasesReservation() {
+        val old = resource("atomic-old", (CACHE_CHUNK * 2).toInt())
+        val fresh = server.add("atomic-new", server.data[old]!!.clone())
+        seed(descriptor("muxed" to listOf(old)), Triple(0, 0L, 64 * 1024))
+        val manifest = File(engine.manifestPath("task"))
+        val original = manifest.readBytes()
+        val pending = File(manifest.path + ".new")
+        assertTrue(pending.mkdir())
+        assertTrue(File(pending, "block").createNewFile())
+        try {
+            expectRefreshFailure("downloadFailed") {
+                engine.newRefreshJob("task") { _, _ -> descriptor("muxed" to listOf(fresh)) }.run()
+            }
+            assertArrayEquals(original, manifest.readBytes())
+            assertEquals(64 * 1024L, engine.bytes("task"))
+            assertArrayEquals(server.data[old]!!.copyOfRange(0, 64 * 1024), read(0, 0L, 64 * 1024L))
+        } finally { pending.deleteRecursively() }
+        reopen()
+        assertEquals(old, engine.session("task").snapshot.tracks.single().parts.single().url)
     }
 
     @Test fun splitTracksFillInterleavedAndResumeOfflineAfterReopen() {
@@ -439,7 +780,8 @@ private class FakeMediaServer : CacheUpstreamFactory {
     val blocked = CountDownLatch(1)
     val release = CountDownLatch(1)
     @Volatile var online = true
-    @Volatile var etag = "\"original\""
+    @Volatile var etag: String? = "\"original\""
+    @Volatile var lastModified: String? = null
     @Volatile var blockAfter = Long.MAX_VALUE
     @Volatile var failAfter = Long.MAX_VALUE
     @Volatile var shortAfter = Long.MAX_VALUE
@@ -463,7 +805,7 @@ private class FakeMediaServer : CacheUpstreamFactory {
             payload = data[dataSpec.uri.toString()] ?: throw IOException("unknown fixture")
             requests.add(FakeRequest(dataSpec.uri.toString(), dataSpec.position, dataSpec.length))
             onOpen(dataSpec)
-            request.onResponse(CacheResponse(payload.size.toLong(), etag, null, !ignoreRanges))
+            request.onResponse(CacheResponse(payload.size.toLong(), etag, lastModified, !ignoreRanges))
             position = dataSpec.position.toInt()
             if (position > payload.size) throw IOException("invalid fixture range")
             val available = (payload.size - position).toLong()

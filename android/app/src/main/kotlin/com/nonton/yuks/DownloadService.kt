@@ -95,8 +95,14 @@ class DownloadService : Service() {
             val progress = (entry?.get("progress") as? Number)?.toFloat() ?: 0f
             val percent = (progress * 100).toInt()
             val title = (entry?.get("title") as? String)?.takeIf { it.isNotBlank() } ?: "Unduhan"
-            val text = when (entry?.get("state")) {
-                DownloadManager.STATE_QUEUED -> "Menunggu antrean"
+            val state = entry?.get("state")
+            val refreshing = entry?.get("phase") == "refresh" &&
+                (state == DownloadManager.STATE_QUEUED || state == DownloadManager.STATE_RUNNING)
+            val text = when (state) {
+                DownloadManager.STATE_QUEUED ->
+                    if (refreshing) "Menunggu verifikasi link" else "Menunggu antrean"
+                DownloadManager.STATE_RUNNING ->
+                    if (refreshing) "Memverifikasi link" else "$percent%"
                 DownloadManager.STATE_DONE -> "Selesai"
                 DownloadManager.STATE_FAILED -> "Gagal, buka aplikasi untuk mencoba lagi"
                 DownloadManager.STATE_CANCELED -> "Dibatalkan"
@@ -108,7 +114,8 @@ class DownloadService : Service() {
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setContentTitle(title)
                 .setContentText(text)
-                .setProgress(100, percent, entry?.get("state") == DownloadManager.STATE_RUNNING)
+                .setProgress(100, if (refreshing) 0 else percent,
+                    refreshing && state == DownloadManager.STATE_RUNNING)
                 .setOnlyAlertOnce(true)
                 .setOngoing(true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

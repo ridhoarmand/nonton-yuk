@@ -83,14 +83,14 @@ class DownloadController extends ChangeNotifier {
 
   /// Validates the link locally before touching the native probe.
   /// The platform is detected from the link itself.
-  Future<ProbeResult> probe(String link) async {
+  Future<ProbeResult> probe(String link, {int height = 0}) async {
     final uri = sharedLink(link);
     final platformId = platformFor(uri)!;
     busy = true;
     error = null;
     _notify();
     try {
-      return await probeLink(uri.toString(), platformId);
+      return await probeLink(uri.toString(), platformId, height: height);
     } on ExtractionException catch (e) {
       error = e.message;
       rethrow;
@@ -137,6 +137,20 @@ class DownloadController extends ChangeNotifier {
   Future<void> pause(String id) => pauseDownload(id);
 
   Future<void> resume(String id) => resumeDownload(id);
+
+  Future<void> refreshLink(String id, {String? url}) async {
+    String? source;
+    if (url != null) {
+      final uri = sharedLink(url);
+      final item = _items[id];
+      if (item != null && platformFor(uri) != item.platform) {
+        throw const ExtractionException('Tautan harus berasal dari platform video yang sama.');
+      }
+      source = uri.toString();
+    }
+    await refreshDownloadLink(id, url: source);
+    await reload();
+  }
 
   Future<void> delete(String id) async {
     try {

@@ -171,7 +171,7 @@ class _NontonYuksAppState extends State<NontonYuksApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'Nonton Yuks',
+    title: 'NontonYuk!',
     theme: _theme(_lightScheme, _lightBg),
     darkTheme: _theme(_darkScheme, _darkBg),
     themeMode: _mode,
@@ -257,6 +257,22 @@ class _CollectionScreenState extends State<CollectionScreen> {
       _sheetOpen = false;
     }
     // Bagikan yang datang saat sheet terbuka mendapat gilirannya sendiri.
+    if (mounted && _stashedShare != null) await _openSheet();
+  }
+
+  Future<void> _openRefresh(SavedMedia item) async {
+    if (_sheetOpen) return;
+    _sheetOpen = true;
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        constraints: const BoxConstraints(maxWidth: 560),
+        builder: (_) => RefreshLinkSheet(controller: controller, item: item),
+      );
+    } finally {
+      _sheetOpen = false;
+    }
     if (mounted && _stashedShare != null) await _openSheet();
   }
 
@@ -362,7 +378,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   ),
                 ),
                 title: Text(
-                  'Nonton Yuks',
+                  'NontonYuk!',
                   style: Theme.of(context).textTheme.titleLarge,
                   textScaler: MediaQuery.textScalerOf(context),
                   maxLines: 2,
@@ -404,6 +420,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       onPause: () => unawaited(controller.pause(active[i].id)),
                       onResume: () => unawaited(controller.resume(active[i].id)),
                       onPlay: () => unawaited(_play(active[i])),
+                      onRefresh: _refreshOf(active[i]),
                     ),
                   ),
                 ],
@@ -429,6 +446,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       onRetry: _retryOf(others[i]),
                       onPlay: others[i].canPlay ? () => unawaited(_play(others[i])) : null,
                       onDelete: () => unawaited(_confirmDelete(others[i])),
+                      onRefresh: _refreshOf(others[i]),
                     ),
                   ),
                 ],
@@ -447,6 +465,21 @@ class _CollectionScreenState extends State<CollectionScreen> {
     if (source == null || source.isEmpty) return null;
     if (platformById(item.platform) == null) return null;
     return () => unawaited(_openSheet(initialText: source));
+  }
+
+  VoidCallback? _refreshOf(SavedMedia item) {
+    if (item.state != TaskState.paused && item.state != TaskState.failed &&
+        item.state != TaskState.interrupted) {
+      return null;
+    }
+    final source = item.sourceUrl;
+    if (source == null || source.isEmpty || platformById(item.platform) == null) return null;
+    try {
+      if (platformFor(sharedLink(source)) != item.platform) return null;
+    } on ExtractionException {
+      return null;
+    }
+    return () => unawaited(_openRefresh(item));
   }
 
   Widget _emptyState() => const Padding(
@@ -636,13 +669,21 @@ class _ThumbFallback extends StatelessWidget {
 }
 
 class _QueueRow extends StatelessWidget {
-  const _QueueRow({required this.item, required this.onCancel, required this.onPause, required this.onResume, required this.onPlay});
+  const _QueueRow({
+    required this.item,
+    required this.onCancel,
+    required this.onPause,
+    required this.onResume,
+    required this.onPlay,
+    this.onRefresh,
+  });
 
   final SavedMedia item;
   final VoidCallback onCancel;
   final VoidCallback onPause;
   final VoidCallback onResume;
   final VoidCallback onPlay;
+  final VoidCallback? onRefresh;
 
   String _detail() {
     final total = item.approxBytes;
@@ -654,8 +695,8 @@ class _QueueRow extends StatelessWidget {
           ? '${formatBytes(item.bytes)} dari ${formatBytes(total)}'
           : '${formatBytes(item.bytes)} diunduh');
     }
-    if (item.speedBps > 0) parts.add(formatSpeed(item.speedBps));
-    if (item.etaSeconds > 0) parts.add('tersisa ${formatDuration(item.etaSeconds * 1000)}');
+    if (!item.refreshing && item.speedBps > 0) parts.add(formatSpeed(item.speedBps));
+    if (!item.refreshing && item.etaSeconds > 0) parts.add('tersisa ${formatDuration(item.etaSeconds * 1000)}');
     return parts.join(' · ');
   }
 
@@ -663,64 +704,77 @@ class _QueueRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final detail = _detail();
-    final pausable = !item.paused;
+    final largeText = MediaQuery.textScalerOf(context).scale(1) >= 1.5;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 8, 12),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-        _Thumb(thumbPath: item.thumbPath, networkUrl: item.thumbnailUrl, durationMs: 0, title: item.title, width: 120),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(item.title, maxLines: 2, overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.titleMedium),
-            const SizedBox(height: 2),
-            Text(item.statusLabel, style: theme.textTheme.bodySmall),
-            if (detail.isNotEmpty) ...[
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _Thumb(
+            thumbPath: item.thumbPath,
+            networkUrl: item.thumbnailUrl,
+            durationMs: 0,
+            title: item.title,
+            width: largeText ? 88 : 120,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(item.title, maxLines: largeText ? 3 : 2, overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.titleMedium),
               const SizedBox(height: 2),
-              Text(detail, style: theme.textTheme.bodySmall?.copyWith(
-                fontFeatures: const [FontFeature.tabularFigures()])),
-            ],
-            const SizedBox(height: 6),
-            LinearProgressIndicator(value: item.active && item.progress > 0 ? item.progress : null),
-          ]),
-        ),
-        if (item.paused)
-          IconButton(
-            icon: const Icon(Icons.play_arrow),
-            tooltip: 'Lanjutkan unduhan',
-            onPressed: onResume,
-          )
-        else if (pausable)
-          IconButton(
-            icon: const Icon(Icons.pause),
-            tooltip: 'Jeda unduhan',
-            onPressed: onPause,
+              Text(item.statusLabel, style: theme.textTheme.bodySmall),
+            ]),
           ),
-        IconButton(
-          icon: const Icon(Icons.close),
-          tooltip: 'Batalkan unduhan',
-          onPressed: onCancel,
-        ),
         ]),
-        if (item.canPlay)
-          TextButton.icon(
-            onPressed: onPlay,
-            icon: const Icon(Icons.play_arrow),
-            label: const Text('Tonton sekarang'),
+        if (detail.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(detail, style: theme.textTheme.bodySmall?.copyWith(
+            fontFeatures: const [FontFeature.tabularFigures()])),
+        ],
+        const SizedBox(height: 6),
+        LinearProgressIndicator(
+          value: !item.refreshing && item.active && item.progress > 0 ? item.progress : null,
+          semanticsLabel: item.statusLabel,
+        ),
+        Wrap(spacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          IconButton(
+            icon: Icon(item.paused ? Icons.play_arrow : Icons.pause),
+            tooltip: item.paused ? 'Lanjutkan unduhan' : 'Jeda unduhan',
+            onPressed: item.paused ? onResume : onPause,
           ),
+          IconButton(
+            icon: const Icon(Icons.close),
+            tooltip: 'Batalkan unduhan',
+            onPressed: onCancel,
+          ),
+          if (item.canPlay)
+            TextButton.icon(
+              onPressed: onPlay,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Tonton sekarang'),
+            ),
+          if (onRefresh != null)
+            TextButton(onPressed: onRefresh, child: const Text('Refresh link')),
+        ]),
       ]),
     );
   }
 }
 
 class _TerminalRow extends StatelessWidget {
-  const _TerminalRow({required this.item, required this.onRetry, required this.onDelete, this.onPlay});
+  const _TerminalRow({
+    required this.item,
+    required this.onRetry,
+    required this.onDelete,
+    this.onPlay,
+    this.onRefresh,
+  });
 
   final SavedMedia item;
   final VoidCallback? onRetry;
   final VoidCallback onDelete;
   final VoidCallback? onPlay;
+  final VoidCallback? onRefresh;
 
   @override
   Widget build(BuildContext context) {
@@ -750,6 +804,8 @@ class _TerminalRow extends StatelessWidget {
                   icon: const Icon(Icons.play_arrow),
                   label: const Text('Tonton sekarang'),
                 ),
+              if (onRefresh != null)
+                TextButton(onPressed: onRefresh, child: const Text('Refresh link')),
             ]),
           ]),
         ),
@@ -779,6 +835,10 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
   ProbeResult? preview;
   String? error;
   bool checking = false;
+  int selectedHeight = 0;
+  bool checkingQuality = false;
+  bool selectionResolved = false;
+  bool submitting = false;
   int _seq = 0;
 
   @override
@@ -790,24 +850,28 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
 
   void _invalidate() {
     _seq++;
-    if (preview != null || error != null || checking) {
-      setState(() {
-        preview = null;
-        error = null;
-        checking = false;
-      });
-    }
+    setState(() {
+      preview = null;
+      error = null;
+      checking = false;
+      checkingQuality = false;
+      selectionResolved = false;
+      selectedHeight = 0;
+    });
   }
 
   Future<void> _paste() async {
+    final ticket = ++_seq;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
-    if (!mounted) return;
+    if (!mounted || ticket != _seq) return;
     final text = data?.text?.trim() ?? '';
-    _seq++;
     if (text.isEmpty) {
       setState(() {
         preview = null;
         checking = false;
+        checkingQuality = false;
+        selectionResolved = false;
+        selectedHeight = 0;
         error = 'Papan klip kosong. Salin tautan lebih dulu, atau bagikan dari aplikasi lain.';
       });
       return;
@@ -817,10 +881,14 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
       preview = null;
       error = null;
       checking = false;
+      checkingQuality = false;
+      selectionResolved = false;
+      selectedHeight = 0;
     });
   }
 
   Future<void> _check() async {
+    if (submitting) return;
     final text = link.text.trim();
     if (text.isEmpty) {
       setState(() => error = 'Tempel tautan video lebih dulu.');
@@ -831,11 +899,20 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
       preview = null;
       error = null;
       checking = true;
+      checkingQuality = false;
+      selectionResolved = false;
     });
     try {
       final result = await widget.controller.probe(text);
-      if (!mounted || ticket != _seq) return; // Tautan berubah; jawaban basi dibuang.
-      setState(() => preview = result);
+      if (!mounted || ticket != _seq || text != link.text.trim()) return;
+      if (result.platform != platformFor(sharedLink(text))) {
+        throw const ExtractionException('Tautan berubah. Periksa ulang sebelum mengunduh.');
+      }
+      setState(() {
+        preview = result;
+        selectedHeight = result.height;
+        selectionResolved = true;
+      });
     } on ExtractionException catch (failure) {
       if (!mounted || ticket != _seq) return;
       setState(() => error = failure.message);
@@ -844,45 +921,68 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
     }
   }
 
-  Future<void> _download({int height = 0}) async {
-    final result = preview;
-    if (result == null) return;
-    if (!await _confirmMobileData()) return;
+  Future<void> _selectHeight(int height) async {
+    final previous = preview;
+    if (previous == null || submitting ||
+        (height == selectedHeight && selectionResolved)) {
+      return;
+    }
+    final text = link.text.trim();
+    final ticket = ++_seq;
+    setState(() {
+      selectedHeight = height;
+      checkingQuality = true;
+      selectionResolved = false;
+      error = null;
+    });
     try {
-      final id = await widget.controller.enqueue(link.text.trim(), result, height: height);
+      final result = await widget.controller.probe(text, height: height);
+      if (!mounted || ticket != _seq || text != link.text.trim()) return;
+      if (result.id != previous.id || result.platform != previous.platform) {
+        throw const ExtractionException('Video berubah. Periksa ulang tautan sebelum mengunduh.');
+      }
+      if (result.height != height) {
+        throw const ExtractionException('Resolusi yang dipilih tidak tersedia lagi. Pilih resolusi lain.');
+      }
+      setState(() {
+        preview = result;
+        selectionResolved = true;
+      });
+    } on ExtractionException catch (failure) {
+      if (mounted && ticket == _seq) setState(() => error = failure.message);
+    } finally {
+      if (mounted && ticket == _seq) setState(() => checkingQuality = false);
+    }
+  }
+
+  Future<void> _download() async {
+    final result = preview;
+    if (result == null || !selectionResolved || checkingQuality || submitting) return;
+    final text = link.text.trim();
+    final height = selectedHeight;
+    final ticket = _seq;
+    setState(() {
+      submitting = true;
+      error = null;
+    });
+    try {
+      if (!await _confirmMobileData(context)) return;
+      if (!mounted || ticket != _seq || text != link.text.trim() ||
+          preview != result || selectedHeight != height || !selectionResolved) {
+        return;
+      }
+      final id = await widget.controller.enqueue(text, result, height: height);
       if (!mounted) return;
       if (id == null) {
         setState(() => error = widget.controller.error ?? 'Unduhan tidak dapat dimulai. Coba lagi.');
         return;
       }
-      if (mounted) Navigator.pop(context, true);
+      Navigator.pop(context, true);
     } on ExtractionException catch (failure) {
-      if (mounted) setState(() => error = failure.message);
+      if (mounted && ticket == _seq) setState(() => error = failure.message);
+    } finally {
+      if (mounted) setState(() => submitting = false);
     }
-  }
-
-  /// Offline-first tool: downloads on cellular need an explicit tap, never a surprise.
-  Future<bool> _confirmMobileData() async {
-    String net;
-    try {
-      net = await networkType();
-    } on ExtractionException {
-      net = 'unknown';
-    }
-    if (net != 'cellular' || !mounted) return true;
-    final go = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Paket data seluler'),
-        content: const Text(
-          'Perangkat tidak memakai Wi-Fi. Unduhan memakai paket data seluler dan bisa menghabiskan kuota.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Batal')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Tetap unduh')),
-        ],
-      ),
-    );
-    return go == true;
   }
 
   @override
@@ -897,12 +997,9 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
     return SafeArea(
       child: SingleChildScrollView(
         padding: EdgeInsets.fromLTRB(20, 12, 20, bottom + 20),
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.9),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
-              Text('Tambah video', style: Theme.of(context).textTheme.titleLarge),
-              const Spacer(),
+              Expanded(child: Text('Tambah video', style: Theme.of(context).textTheme.titleLarge)),
               IconButton(
                 icon: const Icon(Icons.close),
                 tooltip: 'Tutup',
@@ -912,6 +1009,7 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
             const SizedBox(height: 12),
             TextField(
               controller: link,
+              enabled: !submitting,
               minLines: 2,
               maxLines: 4,
               keyboardType: TextInputType.url,
@@ -936,7 +1034,7 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: checking ? null : () => unawaited(_check()),
+                onPressed: checking || submitting ? null : () => unawaited(_check()),
                 icon: checking
                     ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.search),
@@ -945,44 +1043,41 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
             ),
             if (preview != null) ...[
               const SizedBox(height: 16),
-              _PreviewCard(result: preview!, onDownload: (h) => _download(height: h)),
+              _PreviewCard(
+                result: preview!,
+                selectedHeight: selectedHeight,
+                checkingQuality: checkingQuality,
+                selectionResolved: selectionResolved,
+                onSelectHeight: submitting ? null : (height) => unawaited(_selectHeight(height)),
+                onDownload: submitting ? null : () => unawaited(_download()),
+              ),
             ],
           ]),
-        ),
       ),
     );
   }
 }
 
-class _PreviewCard extends StatefulWidget {
-  const _PreviewCard({required this.result, required this.onDownload});
+class _PreviewCard extends StatelessWidget {
+  const _PreviewCard({
+    required this.result,
+    required this.selectedHeight,
+    required this.checkingQuality,
+    required this.selectionResolved,
+    required this.onSelectHeight,
+    required this.onDownload,
+  });
 
   final ProbeResult result;
-  final void Function(int height) onDownload;
-
-  @override
-  State<_PreviewCard> createState() => _PreviewCardState();
-}
-
-class _PreviewCardState extends State<_PreviewCard> {
-  late int selected = widget.result.heights.isNotEmpty
-      ? widget.result.heights.first
-      : widget.result.height;
-
-  @override
-  void didUpdateWidget(covariant _PreviewCard old) {
-    super.didUpdateWidget(old);
-    if (old.result != widget.result) {
-      selected = widget.result.heights.isNotEmpty
-          ? widget.result.heights.first
-          : widget.result.height;
-    }
-  }
+  final int selectedHeight;
+  final bool checkingQuality;
+  final bool selectionResolved;
+  final ValueChanged<int>? onSelectHeight;
+  final VoidCallback? onDownload;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final result = widget.result;
     final url = result.thumbnailUrl;
     final heights = result.heights;
     return Card(
@@ -1014,34 +1109,219 @@ class _PreviewCardState extends State<_PreviewCard> {
               [
                 platformById(result.platform)?.label ?? result.platform,
                 if (result.uploader != null) result.uploader!,
-                if (result.height > 0) 'sampai ${result.height}p',
+                if (selectedHeight > 0) '${selectedHeight}p',
                 if (result.durationMs > 0) formatDuration(result.durationMs),
-                if (result.approxBytes > 0) 'sekitar ${formatBytes(result.approxBytes)}',
               ].join(' · '),
               style: theme.textTheme.bodySmall,
             ),
+            const SizedBox(height: 4),
+            Semantics(
+              liveRegion: true,
+              child: Text(
+                checkingQuality
+                    ? 'Memeriksa ukuran…'
+                    : !selectionResolved
+                        ? 'Ukuran belum terverifikasi'
+                        : result.approxBytes > 0
+                            ? 'sekitar ${formatBytes(result.approxBytes)}'
+                            : 'Ukuran belum diketahui',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
             if (heights.length > 1) ...[
               const SizedBox(height: 12),
-              SegmentedButton<int>(
-                segments: [
-                  for (final h in heights) ButtonSegment(value: h, label: Text('${h}p')),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  for (final height in heights)
+                    ChoiceChip(
+                      label: Text('${height}p'),
+                      selected: selectedHeight == height,
+                      selectedColor: theme.colorScheme.primary,
+                      labelStyle: TextStyle(color: selectedHeight == height
+                          ? theme.colorScheme.onPrimary : theme.colorScheme.onSurface),
+                      side: WidgetStateBorderSide.resolveWith((states) => BorderSide(
+                        color: states.contains(WidgetState.focused)
+                            ? theme.colorScheme.onSurface : theme.colorScheme.outline,
+                        width: states.contains(WidgetState.focused) ? 2 : 1,
+                      )),
+                      showCheckmark: false,
+                      materialTapTargetSize: MaterialTapTargetSize.padded,
+                      onSelected: onSelectHeight == null ? null : (_) => onSelectHeight!(height),
+                    ),
                 ],
-                selected: {selected},
-                onSelectionChanged: (set) => setState(() => selected = set.single),
-                showSelectedIcon: false,
               ),
             ],
             const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
               child: FilledButton(
-                onPressed: () => widget.onDownload(heights.length > 1 ? selected : 0),
-                child: Text(result.approxBytes > 0 ? 'Unduh · ${formatBytes(result.approxBytes)}' : 'Unduh'),
+                onPressed: selectionResolved && !checkingQuality ? onDownload : null,
+                child: Text(selectionResolved && !checkingQuality && result.approxBytes > 0
+                    ? 'Unduh · ${formatBytes(result.approxBytes)}' : 'Unduh'),
               ),
             ),
           ]),
         ),
       ]),
+    );
+  }
+}
+
+Future<bool> _confirmMobileData(BuildContext context) async {
+  String net;
+  try {
+    net = await networkType();
+  } on ExtractionException {
+    net = 'unknown';
+  }
+  if (!context.mounted) return false;
+  if (net != 'cellular') return true;
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Paket data seluler'),
+      content: const Text(
+        'Perangkat tidak memakai Wi-Fi. Unduhan dan verifikasi link memakai paket data seluler '
+        'dan bisa menghabiskan kuota.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Batal')),
+        FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Tetap unduh')),
+      ],
+    ),
+  );
+  return go == true;
+}
+
+class RefreshLinkSheet extends StatefulWidget {
+  const RefreshLinkSheet({super.key, required this.controller, required this.item});
+
+  final DownloadController controller;
+  final SavedMedia item;
+
+  @override
+  State<RefreshLinkSheet> createState() => _RefreshLinkSheetState();
+}
+
+class _RefreshLinkSheetState extends State<RefreshLinkSheet> {
+  final link = TextEditingController();
+  bool useNewLink = false;
+  bool submitting = false;
+  String? error;
+
+  Future<void> _refresh({required bool fromNewLink}) async {
+    if (submitting) return;
+    String? source;
+    try {
+      if (fromNewLink) {
+        final text = link.text.trim();
+        if (text.isEmpty) throw const ExtractionException('Tempel tautan pengganti lebih dulu.');
+        final uri = sharedLink(text);
+        if (platformFor(uri) != widget.item.platform) {
+          throw const ExtractionException('Gunakan tautan dari platform yang sama.');
+        }
+        source = uri.toString();
+      }
+    } on ExtractionException catch (failure) {
+      setState(() => error = failure.message);
+      return;
+    }
+    setState(() {
+      submitting = true;
+      error = null;
+    });
+    try {
+      if (!await _confirmMobileData(context) || !mounted) return;
+      await widget.controller.refreshLink(widget.item.id, url: source);
+      if (mounted) Navigator.pop(context);
+    } on ExtractionException catch (failure) {
+      if (mounted) setState(() => error = failure.message);
+    } finally {
+      if (mounted) setState(() => submitting = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    link.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final stored = formatBytes(widget.item.bytes);
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: EdgeInsets.fromLTRB(20, 12, 20, MediaQuery.viewInsetsOf(context).bottom + 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Refresh link', style: theme.textTheme.titleLarge),
+            const SizedBox(height: 8),
+            Text(widget.item.title, style: theme.textTheme.titleMedium),
+            const SizedBox(height: 12),
+            Text(
+              'Cache tetap disimpan. Verifikasi dapat membaca ulang '
+              '${stored.isNotEmpty ? 'hingga $stored' : 'byte yang sudah tersimpan'} '
+              'untuk mencocokkan sumber baru, lalu melanjutkan unduhan. '
+              'Pembacaan ulang ini memakai waktu dan kuota.',
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: submitting ? null : () => unawaited(_refresh(fromNewLink: false)),
+              child: const Text('Refresh dari link tersimpan'),
+            ),
+            const SizedBox(height: 8),
+            if (!useNewLink)
+              TextButton(
+                onPressed: submitting ? null : () => setState(() {
+                  useNewLink = true;
+                  error = null;
+                }),
+                child: const Text('Gunakan link baru'),
+              )
+            else ...[
+              TextField(
+                controller: link,
+                enabled: !submitting,
+                minLines: 2,
+                maxLines: 4,
+                keyboardType: TextInputType.url,
+                textInputAction: TextInputAction.done,
+                onChanged: (_) {
+                  if (error != null) setState(() => error = null);
+                },
+                onSubmitted: (_) => unawaited(_refresh(fromNewLink: true)),
+                decoration: const InputDecoration(
+                  labelText: 'Tautan pengganti',
+                  hintText: 'Tautan posting atau video dari platform yang sama.',
+                ),
+              ),
+              const SizedBox(height: 12),
+              FilledButton(
+                onPressed: submitting ? null : () => unawaited(_refresh(fromNewLink: true)),
+                child: const Text('Verifikasi dan lanjutkan'),
+              ),
+            ],
+            if (submitting) ...[
+              const SizedBox(height: 12),
+              Semantics(liveRegion: true, child: const Text('Menyiapkan refresh…')),
+            ],
+            if (error != null) ...[
+              const SizedBox(height: 8),
+              Semantics(
+                liveRegion: true,
+                child: Text(error!, style: TextStyle(color: theme.colorScheme.error)),
+              ),
+            ],
+            const SizedBox(height: 8),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
+          ],
+        ),
+      ),
     );
   }
 }

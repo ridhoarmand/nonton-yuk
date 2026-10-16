@@ -126,6 +126,23 @@ void main() {
     expect(media.bytes, 4096);
   });
 
+  test('refresh reservation hides playback only while queued or running', () {
+    final media = SavedMedia(
+      id: 'cached', state: TaskState.paused, playable: true,
+      bytes: 4096, progress: 0.25,
+    );
+    for (final state in ['queued', 'running']) {
+      media.applyEvent({'phase': 'refresh', 'state': state});
+      expect(media.canPlay, isFalse, reason: state);
+      expect(media.bytes, 4096);
+      expect(media.progress, 0.25);
+    }
+    for (final state in ['paused', 'failed', 'interrupted']) {
+      media.applyEvent({'state': state});
+      expect(media.canPlay, isTrue, reason: state);
+    }
+  });
+
   test('capability flags are opt-in booleans and canceled tasks cannot play', () {
     for (final value in [null, 1, 'true', false]) {
       final media = SavedMedia.fromMap({
