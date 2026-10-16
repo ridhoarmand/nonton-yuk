@@ -90,7 +90,7 @@ class Transfer(
             onRestart()
         }
         received = offset
-        var output = FileOutputStream(target, offset > 0L)
+        var output: java.io.OutputStream = FileOutputStream(target, offset > 0L).buffered(256 * 1024)
         try {
             parts.forEach { part ->
                 if (canceled) throw BridgeException("downloadCanceled", CANCELED)
@@ -112,7 +112,7 @@ class Transfer(
 
     private object RestartFromZero : Exception()
 
-    private fun fetch(rawUrl: String, output: FileOutputStream, rangeFrom: Long) {
+    private fun fetch(rawUrl: String, output: java.io.OutputStream, rangeFrom: Long) {
         var uri = mediaUri(rawUrl)
         var hops = 0
         while (true) {
@@ -233,7 +233,7 @@ class Transfer(
             runCatching { secure.close() }
             throw BridgeException("downloadFailed", UNSAFE_HOST)
         }
-        val stream = BufferedInputStream(secure.inputStream)
+        val stream = BufferedInputStream(secure.inputStream, 256 * 1024)
         return try {
             val path = uri.encodedPath.orEmpty().ifEmpty { "/" } +
                 uri.encodedQuery?.let { "?$it" }.orEmpty()

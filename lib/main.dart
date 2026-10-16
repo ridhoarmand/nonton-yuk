@@ -717,6 +717,7 @@ class _QueueRow extends StatelessWidget {
           ? '${formatBytes(item.bytes)} dari ${formatBytes(total)}'
           : '${formatBytes(item.bytes)} diunduh');
     }
+    if (item.speedBps > 0) parts.add(formatSpeed(item.speedBps));
     if (item.etaSeconds > 0) parts.add('tersisa ${formatDuration(item.etaSeconds * 1000)}');
     return parts.join(' · ');
   }

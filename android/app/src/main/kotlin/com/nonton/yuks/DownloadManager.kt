@@ -531,6 +531,11 @@ object DownloadManager {
             val effective = maxOf(total, (entry["approxBytes"] as? Number)?.toLong() ?: 0L)
             if (effective > 0L) entry["progress"] = (bytes.toDouble() / effective).coerceAtMost(0.999)
             val elapsed = now - run.startMs
+            entry["speedBps"] = if (elapsed > 1_000L && bytes > 0L) {
+                (bytes * 1_000L / elapsed).coerceAtLeast(0L)
+            } else {
+                0L
+            }
             entry["etaSeconds"] = if (elapsed > 3_000L && effective > bytes && bytes > 0L) {
                 (((effective - bytes) * elapsed / bytes) / 1_000L).toInt().coerceAtLeast(0)
             } else {

@@ -29,6 +29,9 @@ String formatBytes(int bytes) {
   return '$bytes B';
 }
 
+/// Throughput label such as `1,2 MB/dtk`, `''` when unknown.
+String formatSpeed(int bps) => bps > 0 ? '${formatBytes(bps)}/dtk' : '';
+
 /// Clock label such as `10:35` or `1:02:03`.
 String formatDuration(int milliseconds) {
   if (milliseconds <= 0) return '0:00';
@@ -120,6 +123,7 @@ class SavedMedia {
     this.createdAtMs = 0,
     this.height = 0,
     this.restarted = false,
+    this.speedBps = 0,
   });
 
   String id;
@@ -141,6 +145,7 @@ class SavedMedia {
   int createdAtMs;
   int height;
   bool restarted;
+  int speedBps;
 
   bool get ready => state == TaskState.done && path != null;
 
@@ -195,6 +200,7 @@ class SavedMedia {
       createdAtMs: _int(raw['createdAtMs']),
       height: _int(raw['height']),
       restarted: raw['restarted'] == true,
+      speedBps: _int(raw['speedBps']),
     );
   }
 
@@ -220,6 +226,7 @@ class SavedMedia {
     if (raw.containsKey('createdAtMs')) createdAtMs = _int(raw['createdAtMs']);
     if (raw.containsKey('height')) height = _int(raw['height']);
     if (raw.containsKey('restarted')) restarted = raw['restarted'] == true;
+    if (raw.containsKey('speedBps')) speedBps = _int(raw['speedBps']);
   }
 }
 
